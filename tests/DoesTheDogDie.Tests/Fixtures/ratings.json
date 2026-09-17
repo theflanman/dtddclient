@@ -1,0 +1,22 @@
+[
+  {
+    "id": 3369418,
+    "yes": 1,
+    "no": 0,
+    "voteSum": 0,
+    "triggerDescription": "The dog is shot by his owner...",
+    "isRampant": false,
+    "index1": -1,
+    "index2": -1,
+    "position1": 1,
+    "position2": 18,
+    "position3": 42,
+    "safePosition1": 1,
+    "safePosition2": 20,
+    "safePosition3": 5,
+    "cueDescription": "Travis picks up the gun.",
+    "itemId": 10752,
+    "topicId": 153,
+    "isSceneAlert": true
+  }
+]

@@ -1,0 +1,38 @@
+[
+  {
+    "id": 15,
+    "name": "Movie",
+    "slug": "movie",
+    "verb": "watch",
+    "pastTenseVerb": "watched",
+    "index1Label": null,
+    "index2Label": null,
+    "position1Label": "Hours",
+    "position2Label": "Minutes",
+    "position3Label": "Seconds"
+  },
+  {
+    "id": 16,
+    "name": "TV",
+    "slug": "tv",
+    "verb": "watch",
+    "pastTenseVerb": "watched",
+    "index1Label": "Season",
+    "index2Label": "Episode",
+    "position1Label": "Hours",
+    "position2Label": "Minutes",
+    "position3Label": "Seconds"
+  },
+  {
+    "id": 14,
+    "name": "Book",
+    "slug": "books",
+    "verb": "read",
+    "pastTenseVerb": "read",
+    "index1Label": "chapter",
+    "index2Label": null,
+    "position1Label": null,
+    "position2Label": null,
+    "position3Label": null
+  }
+]

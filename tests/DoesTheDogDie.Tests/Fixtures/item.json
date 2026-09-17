@@ -1,0 +1,24 @@
+{
+  "id": 10752,
+  "name": "Old Yeller",
+  "genres": ["adventure"],
+  "releaseYear": 1957,
+  "itemTypeId": 15,
+  "itemTypeName": "Movie",
+  "tmdbId": 22660,
+  "imdbId": "tt0050798",
+  "backgroundImage": "https://www.doesthedogdie.com/content/dYxm...",
+  "posterImage": "https://www.doesthedogdie.com/content/cpmJ...",
+  "overview": "Young Travis Coates is left to take care of...",
+  "topicItemStats": [
+    {
+      "topicItemId": 395866,
+      "yesSum": 57,
+      "noSum": 3,
+      "numComments": 7,
+      "topicId": 153,
+      "topicName": "a dog dies",
+      "itemId": 10752
+    }
+  ]
+}
