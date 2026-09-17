@@ -1,3 +1,4 @@
+using System.Net;
 using System.Threading.Channels;
 using DoesTheDogDie.Api;
 
@@ -21,6 +22,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private readonly Queue<DateTimeOffset> _sendTimestamps = new();
 
     private RateLimitStatus? _currentBudget;
+    private DateTimeOffset? _exhaustedUntil;
     private bool _disposed;
 
     public ThrottledDtddClient(IDtddApiClient inner, ThrottleOptions? options = null, TimeProvider? timeProvider = null)
@@ -87,6 +89,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         string name, Func<CancellationToken, Task<ApiResponse<T>>> call, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfMonthlyExhausted();
 
         var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -161,6 +164,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             return;
         }
 
+        if (TryGetReserveExhaustedException(out var reserveException))
+        {
+            job.Completion.TrySetException(reserveException);
+            return;
+        }
+
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
 
         // Two attempts total: the original send, plus one retry after a minute-limit Retry-After wait.
@@ -194,6 +203,11 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 }
 
                 job.Completion.TrySetException(ex);
+                return;
+            }
+            catch (DtddMonthlyRateLimitException ex)
+            {
+                HandleMonthlyExhaustion(ex, job);
                 return;
             }
             catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
@@ -254,6 +268,87 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         lock (_stateLock)
         {
             _currentBudget = rateLimit;
+        }
+    }
+
+    /// <summary>
+    /// Throws a fresh <see cref="DtddMonthlyRateLimitException"/>, synchronously and before anything is
+    /// written to the queue, if the monthly budget is known to be exhausted until some future instant.
+    /// </summary>
+    private void ThrowIfMonthlyExhausted()
+    {
+        DateTimeOffset? exhaustedUntil;
+        lock (_stateLock)
+        {
+            exhaustedUntil = _exhaustedUntil;
+        }
+
+        if (exhaustedUntil is not { } until)
+        {
+            return;
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        if (now >= until)
+        {
+            return;
+        }
+
+        throw new DtddMonthlyRateLimitException(
+            HttpStatusCode.TooManyRequests,
+            "monthly_limit_exceeded",
+            "Monthly request budget exhausted.",
+            CurrentBudget,
+            until - now);
+    }
+
+    /// <summary>
+    /// Checks the configured <see cref="ThrottleOptions.MonthlyReserve"/> against the last-observed
+    /// <see cref="RateLimitStatus.MonthRemaining"/>, without making a request. Returns true (with an
+    /// exception ready to fail the job) if sending now would dip into the reserve.
+    /// </summary>
+    private bool TryGetReserveExhaustedException(out DtddMonthlyRateLimitException exception)
+    {
+        var budget = CurrentBudget;
+        if (budget is { MonthRemaining: { } remaining } && remaining - _options.MonthlyReserve <= 0)
+        {
+            var now = _timeProvider.GetUtcNow();
+            var until = _options.MonthResetRule(now);
+            exception = new DtddMonthlyRateLimitException(
+                HttpStatusCode.TooManyRequests, "monthly_limit_exceeded", "Monthly reserve reached", budget, until - now);
+            return true;
+        }
+
+        exception = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Records the monthly budget as exhausted until the configured reset rule says otherwise, fails
+    /// <paramref name="job"/> with <paramref name="ex"/>, and drains every job currently queued behind it,
+    /// failing each with a fresh monthly exception carrying the time remaining until reset.
+    /// </summary>
+    private void HandleMonthlyExhaustion(DtddMonthlyRateLimitException ex, Job job)
+    {
+        UpdateBudget(ex.RateLimit);
+
+        var until = _options.MonthResetRule(_timeProvider.GetUtcNow());
+        lock (_stateLock)
+        {
+            _exhaustedUntil = until;
+        }
+
+        job.Completion.TrySetException(ex);
+
+        while (_channel.Reader.TryRead(out var queued))
+        {
+            var retryAfter = until - _timeProvider.GetUtcNow();
+            queued.Completion.TrySetException(new DtddMonthlyRateLimitException(
+                ex.StatusCode,
+                ex.ErrorCode,
+                ex.Message,
+                CurrentBudget,
+                retryAfter > TimeSpan.Zero ? retryAfter : TimeSpan.Zero));
         }
     }
 

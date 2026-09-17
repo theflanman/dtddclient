@@ -209,4 +209,114 @@ public class ThrottledDtddClientTests
         await Assert.ThrowsAsync<DtddMinuteRateLimitException>(() => task);
         Assert.Equal(2, fake.Calls.Count);
     }
+
+    [Fact]
+    public async Task Monthly429_FailsCurrentAndQueued()
+    {
+        var (fake, _, client) = CreateSut();
+        await using var _ = client;
+
+        var gate = new TaskCompletionSource();
+        fake.BeforeRespond = async (_, _) =>
+        {
+            await gate.Task;
+            return new DtddMonthlyRateLimitException(
+                HttpStatusCode.TooManyRequests, "monthly_limit_exceeded", "out of budget", null, null);
+        };
+
+        var firstTask = client.GetTopicsAsync();
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 1);
+
+        var queuedTask1 = client.GetItemTypesAsync();
+        var queuedTask2 = client.GetTopicCategoriesAsync();
+
+        gate.TrySetResult();
+
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => firstTask);
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => queuedTask1);
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => queuedTask2);
+
+        Assert.DoesNotContain("ItemTypes", fake.Calls);
+        Assert.DoesNotContain("TopicCategories", fake.Calls);
+    }
+
+    [Fact]
+    public async Task Monthly429_NewCallsFailUntilReset()
+    {
+        var (fake, time, client) = CreateSut();
+        await using var _ = client;
+
+        fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(
+            new DtddMonthlyRateLimitException(
+                HttpStatusCode.TooManyRequests, "monthly_limit_exceeded", "out of budget", null, null));
+
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => client.GetTopicsAsync());
+
+        // New calls should fail synchronously, without ever reaching the inner client, until the month resets.
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => client.GetItemTypesAsync());
+        Assert.DoesNotContain("ItemTypes", fake.Calls);
+
+        fake.BeforeRespond = null;
+
+        var resetAt = ThrottleOptions.NextUtcMonthStart(time.GetUtcNow());
+        time.Advance(resetAt - time.GetUtcNow());
+
+        var result = await client.GetTopicCategoriesAsync();
+        Assert.Equal(ResultSource.Live, result.Source);
+    }
+
+    [Fact]
+    public async Task Reserve_BlocksWhenRemainingAtReserve()
+    {
+        var (fake, _, client) = CreateSut(new ThrottleOptions { MonthlyReserve = 5 });
+        await using var _ = client;
+
+        fake.NextRateLimit = new RateLimitStatus(30, 30, 5000, 5, StartTime);
+
+        var first = await client.GetTopicsAsync();
+        Assert.Equal(ResultSource.Live, first.Source);
+        Assert.Equal(5, client.CurrentBudget?.MonthRemaining);
+
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => client.GetItemTypesAsync());
+        Assert.DoesNotContain("ItemTypes", fake.Calls);
+    }
+
+    [Fact]
+    public async Task QueueFull_Throws()
+    {
+        var (fake, _, client) = CreateSut(new ThrottleOptions { MaxQueueLength = 1 });
+        await using var scope = client;
+
+        var gate = new TaskCompletionSource();
+        fake.BeforeRespond = async (_, _) =>
+        {
+            await gate.Task;
+            return null;
+        };
+
+        var firstTask = client.GetTopicsAsync();
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 1);
+
+        var secondTask = client.GetItemTypesAsync();
+
+        // The queue is full; GetTopicCategoriesAsync must throw synchronously (before returning a Task), not
+        // via a faulted Task, so this is a plain try/catch rather than Assert.Throws(Async).
+        DtddQueueFullException? thrown = null;
+        try
+        {
+            _ = client.GetTopicCategoriesAsync();
+        }
+        catch (DtddQueueFullException ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.NotNull(thrown);
+        Assert.Equal(1, thrown.MaxLength);
+
+        gate.TrySetResult();
+
+        await firstTask;
+        await secondTask;
+    }
 }
