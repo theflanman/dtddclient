@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// Item detail, including per-topic vote stats, as returned by the item detail endpoint.

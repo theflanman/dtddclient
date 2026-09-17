@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// A high-level grouping of topic categories (e.g. "Animals", "Mental Health").

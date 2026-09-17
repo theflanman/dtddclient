@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// A single report combining an item, a topic, a yes/no vote, and optional details about a specific

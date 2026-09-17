@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// A type of trigger or content warning (e.g. "a dog dies", "there are jump scares").

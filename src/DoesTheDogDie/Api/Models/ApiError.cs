@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// The error body returned by the DtDD API on non-2xx responses.

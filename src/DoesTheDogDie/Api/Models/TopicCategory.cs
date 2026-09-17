@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// A grouping of related topics (e.g. "Animal Death", "Drugs/Alcohol").

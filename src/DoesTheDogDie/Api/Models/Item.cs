@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// A movie, TV show, book, or other piece of media, as returned by the search endpoint (without stats).

@@ -1,6 +1,5 @@
 using System.Text.Json;
 using DoesTheDogDie.Api;
-using DoesTheDogDie.Api.Models;
 using DoesTheDogDie.Tests.Support;
 
 namespace DoesTheDogDie.Tests.Api;
@@ -75,6 +74,7 @@ public class ModelSerializationTests
         Assert.Equal("a dog dies", topic.Name);
         Assert.Equal("no dogs die", topic.NotName);
         Assert.Equal("Dog death, canine death...", topic.Keywords);
+        Assert.Equal("...", topic.Description);
         Assert.Equal("Does the dog die", topic.DoesName);
         Assert.Equal("where the dog dies", topic.ListName);
         Assert.Equal("dogs dying", topic.MinimalName);

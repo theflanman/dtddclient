@@ -1,4 +1,4 @@
-namespace DoesTheDogDie.Api.Models;
+namespace DoesTheDogDie.Api;
 
 /// <summary>
 /// The kind of media — movie, TV show, book, etc. Determines which index and position labels apply.
