@@ -26,4 +26,27 @@ public record Item
     public string? PosterImage { get; init; }
 
     public string? Overview { get; init; }
+
+    /// <summary>
+    /// Structural equality, overriding the record-synthesized member-wise comparison so that
+    /// <see cref="Genres"/> is compared by content rather than by reference. This matters because a
+    /// persistent cache (e.g. a SQLite-backed <see cref="Cache.IDtddCache"/>) round-trips values through
+    /// JSON, always producing a fresh list instance even for equal content.
+    /// </summary>
+    public virtual bool Equals(Item? other) =>
+        other is not null &&
+        EqualityContract == other.EqualityContract &&
+        Id == other.Id &&
+        Name == other.Name &&
+        Genres.SequenceEqual(other.Genres) &&
+        ReleaseYear == other.ReleaseYear &&
+        ItemTypeId == other.ItemTypeId &&
+        ItemTypeName == other.ItemTypeName &&
+        TmdbId == other.TmdbId &&
+        ImdbId == other.ImdbId &&
+        BackgroundImage == other.BackgroundImage &&
+        PosterImage == other.PosterImage &&
+        Overview == other.Overview;
+
+    public override int GetHashCode() => HashCode.Combine(Id, Name, ItemTypeId, ItemTypeName, ReleaseYear);
 }
