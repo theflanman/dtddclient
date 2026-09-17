@@ -1,11 +1,13 @@
-using System;
-
 namespace DoesTheDogDie.Statistics;
 
 /// <summary>
 /// The Beta(Alpha, Beta) posterior distribution over the probability that a trigger is present,
 /// obtained by combining a <see cref="BetaPrior"/> with observed yes/no vote counts.
 /// </summary>
+/// <remarks>
+/// <c>default(BetaPosterior)</c> is not a valid instance: it has <c>Alpha == 0</c> and <c>Beta == 0</c>, which
+/// the constructor itself rejects. Always construct via the constructor or <see cref="FromCounts"/>.
+/// </remarks>
 public readonly record struct BetaPosterior
 {
     public BetaPosterior(double alpha, double beta)

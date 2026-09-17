@@ -55,41 +55,38 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     public Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(search);
-        return EnqueueAsync($"Search:{search.ToQueryString()}", c => _inner.SearchItemsAsync(search, c), ct);
+        return EnqueueAsync(c => _inner.SearchItemsAsync(search, c), ct);
     }
 
     /// <inheritdoc />
     public Task<DtddResult<ItemDetail>> GetItemAsync(int itemId, CancellationToken ct = default)
-        => EnqueueAsync($"GetItem:{itemId}", c => _inner.GetItemAsync(itemId, c), ct);
+        => EnqueueAsync(c => _inner.GetItemAsync(itemId, c), ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsAsync(int itemId, int? topicId = null, CancellationToken ct = default)
-        => EnqueueAsync(
-            topicId is { } id ? $"Ratings:{itemId}:{id}" : $"Ratings:{itemId}",
-            c => _inner.GetRatingsAsync(itemId, topicId, c),
-            ct);
+        => EnqueueAsync(c => _inner.GetRatingsAsync(itemId, topicId, c), ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsAsync(CancellationToken ct = default)
-        => EnqueueAsync("Topics", c => _inner.GetTopicsAsync(c), ct);
+        => EnqueueAsync(c => _inner.GetTopicsAsync(c), ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesAsync(CancellationToken ct = default)
-        => EnqueueAsync("ItemTypes", c => _inner.GetItemTypesAsync(c), ct);
+        => EnqueueAsync(c => _inner.GetItemTypesAsync(c), ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesAsync(CancellationToken ct = default)
-        => EnqueueAsync("TopicCategories", c => _inner.GetTopicCategoriesAsync(c), ct);
+        => EnqueueAsync(c => _inner.GetTopicCategoriesAsync(c), ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesAsync(CancellationToken ct = default)
-        => EnqueueAsync("TopicSuperCategories", c => _inner.GetTopicSuperCategoriesAsync(c), ct);
+        => EnqueueAsync(c => _inner.GetTopicSuperCategoriesAsync(c), ct);
 
     /// <summary>
     /// Enqueues an API call to be served by the background consumer, and awaits its result.
     /// </summary>
     private Task<DtddResult<T>> EnqueueAsync<T>(
-        string name, Func<CancellationToken, Task<ApiResponse<T>>> call, CancellationToken ct)
+        Func<CancellationToken, Task<ApiResponse<T>>> call, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(IsDisposed, this);
         ThrowIfMonthlyExhausted();
@@ -98,7 +95,6 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         var job = new Job
         {
-            Name = name,
             Token = ct,
             Completion = tcs,
             Execute = async jobCt =>
@@ -501,8 +497,6 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// <summary>A unit of queued work: a wrapped API call plus the plumbing to report its outcome.</summary>
     private sealed class Job
     {
-        public required string Name { get; init; }
-
         public required Func<CancellationToken, Task<object>> Execute { get; init; }
 
         public required TaskCompletionSource<object> Completion { get; init; }

@@ -39,6 +39,27 @@ public sealed class SqliteDtddCache : IDtddCache
             pragma.ExecuteNonQuery();
         }
 
+        // M2: check the schema version BEFORE creating any table, so a mismatched existing database is
+        // rejected without this constructor first mutating it (e.g. adding tables/indexes it has no business
+        // touching once we know we can't safely operate on it).
+        string? existingVersion = null;
+        using (var metaExists = connection.CreateCommand())
+        {
+            metaExists.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta';";
+            if (metaExists.ExecuteScalar() is not null)
+            {
+                using var versionCheck = connection.CreateCommand();
+                versionCheck.CommandText = "SELECT value FROM meta WHERE key = 'schema_version';";
+                existingVersion = versionCheck.ExecuteScalar() as string;
+            }
+        }
+
+        if (existingVersion is not null && existingVersion != SqliteSchema.Version)
+        {
+            throw new InvalidOperationException(
+                $"Cache database has schema version '{existingVersion}' but this library supports version '{SqliteSchema.Version}'. No migrations are available.");
+        }
+
         using (var create = connection.CreateCommand())
         {
             create.CommandText = string.Join(
@@ -53,23 +74,12 @@ public sealed class SqliteDtddCache : IDtddCache
             create.ExecuteNonQuery();
         }
 
-        using (var versionCheck = connection.CreateCommand())
+        if (existingVersion is null)
         {
-            versionCheck.CommandText = "SELECT value FROM meta WHERE key = 'schema_version';";
-            var existing = versionCheck.ExecuteScalar() as string;
-
-            if (existing is null)
-            {
-                using var insert = connection.CreateCommand();
-                insert.CommandText = "INSERT INTO meta(key, value) VALUES ('schema_version', $version);";
-                insert.Parameters.AddWithValue("$version", SqliteSchema.Version);
-                insert.ExecuteNonQuery();
-            }
-            else if (existing != SqliteSchema.Version)
-            {
-                throw new InvalidOperationException(
-                    $"Cache database has schema version '{existing}' but this library supports version '{SqliteSchema.Version}'. No migrations are available.");
-            }
+            using var insert = connection.CreateCommand();
+            insert.CommandText = "INSERT INTO meta(key, value) VALUES ('schema_version', $version);";
+            insert.Parameters.AddWithValue("$version", SqliteSchema.Version);
+            insert.ExecuteNonQuery();
         }
     }
 

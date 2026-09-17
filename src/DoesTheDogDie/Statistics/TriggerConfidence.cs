@@ -16,6 +16,18 @@ public sealed record TriggerConfidence(BetaPosterior Posterior, double Lower, do
     {
         var effectiveOptions = options ?? ConfidenceOptions.Default;
 
+        if (effectiveOptions.IntervalMass <= 0 || effectiveOptions.IntervalMass >= 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options), effectiveOptions.IntervalMass, $"{nameof(ConfidenceOptions.IntervalMass)} must be strictly between 0 and 1.");
+        }
+
+        if (effectiveOptions.DecisionThreshold < 0 || effectiveOptions.DecisionThreshold > 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options), effectiveOptions.DecisionThreshold, $"{nameof(ConfidenceOptions.DecisionThreshold)} must be in [0, 1].");
+        }
+
         var posterior = BetaPosterior.FromCounts(yes, no, effectiveOptions.Prior);
         var (lower, upper) = posterior.CredibleInterval(effectiveOptions.IntervalMass);
 

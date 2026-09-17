@@ -12,6 +12,6 @@ public static class DtddAttribution
     /// <summary>The URL the attribution phrase must link to.</summary>
     public const string Url = "https://www.doesthedogdie.com";
 
-    /// <summary>A ready-made HTML attribution link.</summary>
-    public const string Html = "<a href=\"https://www.doesthedogdie.com\" target=\"_blank\" rel=\"noopener\">Powered by DoesTheDogDie.com</a>";
+    /// <summary>A ready-made HTML attribution link, built from <see cref="Url"/> and <see cref="Phrase"/>.</summary>
+    public const string Html = $"<a href=\"{Url}\" target=\"_blank\" rel=\"noopener\">{Phrase}</a>";
 }

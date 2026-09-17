@@ -73,4 +73,25 @@ public class TriggerConfidenceTests
 
         Assert.Equal(confidence.Posterior.Mean, confidence.ProbabilityPresent, 1e-12);
     }
+
+    [Fact]
+    public void InvalidOptions_ThrowWithClearMessages()
+    {
+        // M6 regression test: IntervalMass/DecisionThreshold outside their valid ranges must fail fast, with a
+        // message naming the offending option, rather than either silently misbehaving (DecisionThreshold) or
+        // surfacing a confusing exception from deep inside BetaPosterior.CredibleInterval (IntervalMass).
+        var badIntervalMass = Assert.Throws<ArgumentOutOfRangeException>(
+            () => TriggerConfidence.Compute(57, 3, new ConfidenceOptions { IntervalMass = 0.0 }));
+        Assert.Contains(nameof(ConfidenceOptions.IntervalMass), badIntervalMass.Message);
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => TriggerConfidence.Compute(57, 3, new ConfidenceOptions { IntervalMass = 1.0 }));
+
+        var badThreshold = Assert.Throws<ArgumentOutOfRangeException>(
+            () => TriggerConfidence.Compute(57, 3, new ConfidenceOptions { DecisionThreshold = -0.1 }));
+        Assert.Contains(nameof(ConfidenceOptions.DecisionThreshold), badThreshold.Message);
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => TriggerConfidence.Compute(57, 3, new ConfidenceOptions { DecisionThreshold = 1.1 }));
+    }
 }
