@@ -18,6 +18,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private readonly Task _loopTask;
     private readonly Lock _stateLock = new();
 
+    private readonly Queue<DateTimeOffset> _sendTimestamps = new();
+
     private RateLimitStatus? _currentBudget;
     private bool _disposed;
 
@@ -161,23 +163,84 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
 
-        try
+        // Two attempts total: the original send, plus one retry after a minute-limit Retry-After wait.
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            var result = await job.Execute(linked.Token).ConfigureAwait(false);
-            job.Completion.TrySetResult(result);
-        }
-        catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
-        {
-            job.Completion.TrySetCanceled(job.Token);
-        }
-        catch (Exception ex)
-        {
-            if (ex is DtddApiException apiEx)
+            try
             {
-                UpdateBudget(apiEx.RateLimit);
+                await WaitForMinuteWindowAsync(linked.Token).ConfigureAwait(false);
+                var result = await job.Execute(linked.Token).ConfigureAwait(false);
+                job.Completion.TrySetResult(result);
+                return;
+            }
+            catch (DtddMinuteRateLimitException ex)
+            {
+                UpdateBudget(ex.RateLimit);
+
+                if (attempt == 0)
+                {
+                    try
+                    {
+                        await Task.Delay(ex.RetryAfter ?? TimeSpan.FromSeconds(60), _timeProvider, linked.Token)
+                            .ConfigureAwait(false);
+
+                        continue;
+                    }
+                    catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
+                    {
+                        job.Completion.TrySetCanceled(job.Token);
+                        return;
+                    }
+                }
+
+                job.Completion.TrySetException(ex);
+                return;
+            }
+            catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
+            {
+                job.Completion.TrySetCanceled(job.Token);
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (ex is DtddApiException apiEx)
+                {
+                    UpdateBudget(apiEx.RateLimit);
+                }
+
+                job.Completion.TrySetException(ex);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Waits, if necessary, until sending would keep the in-house sliding window under the current per-minute
+    /// limit, then records the send timestamp. Only ever called from the single consumer loop.
+    /// </summary>
+    private async Task WaitForMinuteWindowAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            var limit = CurrentBudget?.MinuteLimit ?? _options.DefaultMinuteLimit;
+            var now = _timeProvider.GetUtcNow();
+
+            while (_sendTimestamps.Count > 0 && now - _sendTimestamps.Peek() >= TimeSpan.FromSeconds(60))
+            {
+                _sendTimestamps.Dequeue();
             }
 
-            job.Completion.TrySetException(ex);
+            if (_sendTimestamps.Count < limit)
+            {
+                _sendTimestamps.Enqueue(now);
+                return;
+            }
+
+            var wait = _sendTimestamps.Peek() + TimeSpan.FromSeconds(60) - now;
+            if (wait > TimeSpan.Zero)
+            {
+                await Task.Delay(wait, _timeProvider, ct).ConfigureAwait(false);
+            }
         }
     }
 

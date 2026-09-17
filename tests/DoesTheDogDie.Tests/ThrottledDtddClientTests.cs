@@ -1,3 +1,4 @@
+using System.Net;
 using DoesTheDogDie.Api;
 using DoesTheDogDie.Tests.Support;
 using Microsoft.Extensions.Time.Testing;
@@ -111,5 +112,101 @@ public class ThrottledDtddClientTests
         await firstTask;
 
         Assert.DoesNotContain("ItemTypes", fake.Calls);
+    }
+
+    [Fact]
+    public async Task MinuteLimit_31stCallWaitsForWindow()
+    {
+        var (fake, time, client) = CreateSut();
+        await using var _ = client;
+
+        var tasks = Enumerable.Range(0, 31).Select(_ => client.GetTopicsAsync()).ToList();
+
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 30);
+        for (var i = 0; i < 20; i++)
+        {
+            await Task.Delay(1);
+        }
+
+        Assert.Equal(30, fake.Calls.Count);
+
+        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(60), () => fake.Calls.Count == 31);
+        await Task.WhenAll(tasks);
+        Assert.Equal(31, fake.Calls.Count);
+    }
+
+    [Fact]
+    public async Task MinuteLimit_SeededFromHeader()
+    {
+        var (fake, time, client) = CreateSut();
+        await using var _ = client;
+
+        fake.NextRateLimit = new RateLimitStatus(5, 5, 5000, 5000, StartTime);
+
+        var tasks = Enumerable.Range(0, 6).Select(_ => client.GetTopicsAsync()).ToList();
+
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 5);
+        for (var i = 0; i < 20; i++)
+        {
+            await Task.Delay(1);
+        }
+
+        Assert.Equal(5, fake.Calls.Count);
+
+        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(60), () => fake.Calls.Count == 6);
+        await Task.WhenAll(tasks);
+    }
+
+    [Fact]
+    public async Task Minute429_PausesForRetryAfterThenRetries()
+    {
+        var (fake, time, client) = CreateSut();
+        await using var _ = client;
+
+        var attempt = 0;
+        fake.BeforeRespond = (_, _) =>
+        {
+            attempt++;
+            Exception? result = attempt == 1
+                ? new DtddMinuteRateLimitException(
+                    HttpStatusCode.TooManyRequests, "rate_limit_exceeded", "slow down", null, TimeSpan.FromSeconds(10))
+                : null;
+            return Task.FromResult(result);
+        };
+
+        var task = client.GetTopicsAsync();
+
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 1);
+        Assert.False(task.IsCompleted);
+
+        // A single time.Advance(10s) call only fires a retry-after timer that already exists; the background
+        // consumer registers that timer asynchronously relative to this thread, so advance repeatedly (see
+        // AsyncAssert.WaitUntilAsync(FakeTimeProvider, ...) for why a single call is not reliable here).
+        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(10), () => task.IsCompleted);
+        await task;
+
+        Assert.Equal(2, fake.Calls.Count);
+    }
+
+    [Fact]
+    public async Task Minute429_TwiceThrows()
+    {
+        var (fake, time, client) = CreateSut();
+        await using var _ = client;
+
+        fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(
+            new DtddMinuteRateLimitException(
+                HttpStatusCode.TooManyRequests, "rate_limit_exceeded", "slow down", null, TimeSpan.FromSeconds(5)));
+
+        var task = client.GetTopicsAsync();
+
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 1);
+
+        // See the comment in Minute429_PausesForRetryAfterThenRetries for why a single Advance() call is not
+        // reliable here.
+        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(5), () => fake.Calls.Count == 2);
+
+        await Assert.ThrowsAsync<DtddMinuteRateLimitException>(() => task);
+        Assert.Equal(2, fake.Calls.Count);
     }
 }
