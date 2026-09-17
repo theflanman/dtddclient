@@ -21,6 +21,36 @@ public class DtddApiClientTests
         response.Headers.Add("X-RateLimit-Remaining-Month", "4999");
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Constructor_EmptyApiKey_Throws(string apiKey)
+    {
+        var httpClient = new HttpClient(new StubHttpMessageHandler(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        var options = new DtddApiOptions { ApiKey = apiKey };
+
+        Assert.Throws<ArgumentException>(() => new DtddApiClient(httpClient, options));
+    }
+
+    [Fact]
+    public async Task Constructor_NormalizesBaseAddressTrailingSlash()
+    {
+        var handler = new StubHttpMessageHandler(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, Fixtures.Read("topics.json"), AddRateLimitHeaders));
+        var httpClient = new HttpClient(handler);
+        var options = new DtddApiOptions
+        {
+            ApiKey = "ddd_test_key",
+            BaseAddress = new Uri("https://example.test/api/v3"),
+        };
+        var client = new DtddApiClient(httpClient, options);
+
+        await client.GetTopicsAsync();
+
+        Assert.Equal("https://example.test/api/v3/topics", handler.Requests[0].RequestUri!.ToString());
+    }
+
     [Fact]
     public async Task Search_BuildsUrlAndHeader()
     {
