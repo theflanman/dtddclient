@@ -24,7 +24,12 @@ public interface IDtddClient
     /// <summary>The most recently observed rate-limit budget, or null if none has been observed yet.</summary>
     RateLimitStatus? CurrentBudget { get; }
 
-    /// <summary>Searches for items.</summary>
+    /// <summary>
+    /// Searches for items. For an exact lookup (imdb/tmdb/name), a caching implementation resolves and caches
+    /// the match by <em>first call</em>: once a lookup has resolved to an item id, later calls with the same
+    /// search are expected to return a one-element <c>Item</c> list for that id rather than re-searching, and
+    /// that mapping is treated as permanent (DtDD ids are not reassigned to a different item).
+    /// </summary>
     Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default);
 
     /// <summary>Fetches an item's detail, including per-topic stats.</summary>

@@ -297,4 +297,199 @@ public class CachedDtddClientTests
 
         Assert.Equal(budget, client.CurrentBudget);
     }
+
+    [Fact]
+    public async Task Miss_StoresEvenIfCallerCancelsAfterResponse()
+    {
+        // I1 regression test: once the inner call has returned a response, the cache write must not be
+        // cancellable by the caller's own token -- otherwise a caller that cancels right after receiving its
+        // result (a common pattern: "I have what I need, tear down") silently discards a response that cost
+        // real monthly budget to fetch. ThrowingCtCache throws if it is ever handed a cancelled token, so this
+        // test fails loudly (rather than just "the cache is empty") if the bug regresses.
+        //
+        // Uses SearchItemsAsync's direct item-fetch branch (lookup already resolved to an id, but the item
+        // itself not yet cached) rather than GetItemAsync: that branch fetches+stores the item outright, so
+        // this test is not entangled with the coalesced-miss cancellation semantics of ReadThroughAsync/I2
+        // (where WaitAsync(ct) legitimately surfaces the caller's own cancellation).
+        var time = new FakeTimeProvider(StartTime);
+        var inner = new FakeDtddClient { Now = StartTime };
+        var cache = new ThrowingCtCache(new InMemoryDtddCache(ShortPolicy, time));
+        var client = new CachedDtddClient(inner, cache, ShortPolicy, time);
+
+        var search = ItemSearch.ByImdbId("tt123");
+        inner.SearchResult = [new Item { Id = 10752, Name = "Old Yeller", ItemTypeId = 15, ItemTypeName = "Movie" }];
+
+        // Seed a positive lookup without caching the item itself.
+        await client.SearchItemsAsync(search);
+        inner.ClearCalls();
+
+        using var cts = new CancellationTokenSource();
+        inner.BeforeRespond = _ =>
+        {
+            cts.Cancel();
+            return Task.FromResult<Exception?>(null);
+        };
+
+        var result = await client.SearchItemsAsync(search, cts.Token);
+
+        Assert.Equal(ResultSource.Live, result.Source);
+        Assert.Single(result.Value);
+        Assert.Equal(10752, result.Value[0].Id);
+
+        var itemEntry = await cache.GetItemAsync(10752);
+        Assert.NotNull(itemEntry);
+    }
+
+    [Fact]
+    public async Task Miss_CoalescesConcurrentFetches()
+    {
+        // I2 regression test: two concurrent misses for the same key must coalesce into a single inner call,
+        // the same way concurrent stale-refreshes already do.
+        var (inner, _, _, client) = CreateSut();
+
+        var gate = new TaskCompletionSource();
+        inner.BeforeRespond = async _ =>
+        {
+            await gate.Task;
+            return null;
+        };
+
+        var first = client.GetItemAsync(10752);
+        var second = client.GetItemAsync(10752);
+
+        gate.SetResult();
+
+        var firstResult = await first;
+        var secondResult = await second;
+
+        Assert.Equal(ResultSource.Live, firstResult.Source);
+        Assert.Equal(ResultSource.Live, secondResult.Source);
+        Assert.Equal(["GetItem:10752"], inner.Calls);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_AwaitsInFlightRefresh()
+    {
+        // I3 regression test: disposal must not race an in-flight background refresh -- awaiting DisposeAsync
+        // must guarantee the refresh (and thus its cache write) has actually finished, not merely been started.
+        var (inner, cache, time, client) = CreateSut();
+
+        await client.GetItemAsync(10752);
+        time.Advance(TimeSpan.FromMinutes(11));
+        inner.Now = time.GetUtcNow();
+
+        var gate = new TaskCompletionSource();
+        inner.BeforeRespond = async _ =>
+        {
+            await gate.Task;
+            return null;
+        };
+
+        var stale = await client.GetItemAsync(10752);
+        Assert.Equal(ResultSource.StaleCache, stale.Source);
+        Assert.NotNull(client.LastRefresh);
+
+        var disposeTask = client.DisposeAsync().AsTask();
+
+        // DisposeAsync must actually be waiting on the in-flight refresh, not racing ahead of it.
+        Assert.False(disposeTask.IsCompleted);
+
+        gate.SetResult();
+        await disposeTask;
+
+        var entry = await cache.GetItemAsync(10752);
+        Assert.NotNull(entry);
+        Assert.False(entry!.IsStale);
+
+        // GetItemAsync throws synchronously (before returning a Task) once disposed, so this is a plain
+        // try/catch rather than Assert.Throws(Async) -- see the same pattern in ThrottledDtddClientTests.
+        ObjectDisposedException? thrown = null;
+        try
+        {
+            _ = client.GetItemAsync(10752);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.NotNull(thrown);
+    }
+
+    [Fact]
+    public async Task Search_Imdb_NegativeStale_RefreshesLookup()
+    {
+        var (inner, cache, time, client) = CreateSut();
+        inner.SearchResult = [];
+        var search = ItemSearch.ByImdbId("tt000");
+
+        await client.SearchItemsAsync(search);
+        time.Advance(TimeSpan.FromMinutes(11));
+        inner.Now = time.GetUtcNow();
+
+        var gate = new TaskCompletionSource();
+        inner.BeforeRespond = async _ =>
+        {
+            await gate.Task;
+            return null;
+        };
+
+        var stale = await client.SearchItemsAsync(search);
+
+        Assert.Equal(ResultSource.StaleCache, stale.Source);
+        Assert.Empty(stale.Value);
+        Assert.Single(inner.Calls);
+        Assert.NotNull(client.LastRefresh);
+
+        gate.SetResult();
+        await client.LastRefresh!;
+
+        Assert.Equal(2, inner.Calls.Count);
+
+        var lookupEntry = await cache.GetLookupAsync(LookupKey.Imdb("tt000"));
+        Assert.NotNull(lookupEntry);
+        Assert.Null(lookupEntry!.Value);
+        Assert.False(lookupEntry.IsStale);
+        Assert.Equal(time.GetUtcNow(), lookupEntry.FetchedAt);
+    }
+
+    [Fact]
+    public async Task Search_Imdb_PositiveStaleItem_RefreshesItem()
+    {
+        var (inner, cache, time, client) = CreateSut();
+        var search = ItemSearch.ByImdbId("tt123");
+        inner.SearchResult = [new Item { Id = 10752, Name = "Old Yeller", ItemTypeId = 15, ItemTypeName = "Movie" }];
+
+        await client.SearchItemsAsync(search);
+        await client.GetItemAsync(10752);
+        inner.ClearCalls();
+
+        time.Advance(TimeSpan.FromMinutes(11));
+        inner.Now = time.GetUtcNow();
+
+        var gate = new TaskCompletionSource();
+        inner.BeforeRespond = async _ =>
+        {
+            await gate.Task;
+            return null;
+        };
+
+        var stale = await client.SearchItemsAsync(search);
+
+        Assert.Equal(ResultSource.StaleCache, stale.Source);
+        Assert.Single(stale.Value);
+        Assert.Equal(10752, stale.Value[0].Id);
+        Assert.NotNull(client.LastRefresh);
+
+        gate.SetResult();
+        await client.LastRefresh!;
+
+        // The refresh re-fetches the item detail: the imdb->id lookup itself is treated as permanent and is
+        // never re-queried.
+        Assert.Equal(["GetItem:10752"], inner.Calls);
+
+        var itemEntry = await cache.GetItemAsync(10752);
+        Assert.NotNull(itemEntry);
+        Assert.False(itemEntry!.IsStale);
+    }
 }

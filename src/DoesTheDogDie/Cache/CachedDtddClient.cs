@@ -5,19 +5,26 @@ namespace DoesTheDogDie.Cache;
 
 /// <summary>
 /// A read-through caching decorator over an <see cref="IDtddClient"/>. A cache hit returns immediately; a
-/// cache miss calls through to <paramref name="inner"/> (see constructor) and stores the result. A stale
-/// entry is returned immediately (flagged <see cref="ResultSource.StaleCache"/>), and — when
-/// <see cref="CachePolicy.RefreshStaleInBackground"/> is set — a fire-and-forget refresh is started to
-/// repopulate the cache, coalesced per key so concurrent stale reads only trigger one inner call.
+/// cache miss calls through to <paramref name="inner"/> (see constructor) and stores the result, coalesced
+/// per key so concurrent misses only trigger one inner call. A stale entry is returned immediately (flagged
+/// <see cref="ResultSource.StaleCache"/>), and — when <see cref="CachePolicy.RefreshStaleInBackground"/> is
+/// set — a fire-and-forget refresh is started to repopulate the cache, likewise coalesced per key.
 /// </summary>
-public sealed class CachedDtddClient : IDtddClient
+/// <remarks>
+/// <see cref="SearchItemsAsync"/>'s name/imdb/tmdb lookups are cached by their first match: once a lookup
+/// resolves to an item id, that mapping is treated as permanent (DtDD ids are not reassigned to a different
+/// item — see the remarks on that method), and later calls with the same search return a one-element
+/// <c>Item</c> list sourced from the item's own cache entry rather than re-searching.
+/// </remarks>
+public sealed class CachedDtddClient : IDtddClient, IAsyncDisposable
 {
     private readonly IDtddClient _inner;
     private readonly IDtddCache _cache;
     private readonly CachePolicy _policy;
-    private readonly TimeProvider _time;
     private readonly ConcurrentDictionary<string, Lazy<Task>> _inFlightRefreshes = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<object>>> _inFlightMisses = new();
     private Task? _lastRefresh;
+    private int _disposedFlag;
 
     /// <summary>Raised when a background refresh throws; the exception is otherwise swallowed.</summary>
     public event Action<Exception>? RefreshFailed;
@@ -37,6 +44,11 @@ public sealed class CachedDtddClient : IDtddClient
         private set => Volatile.Write(ref _lastRefresh, value);
     }
 
+    /// <param name="timeProvider">
+    /// Accepted for constructor symmetry with InMemoryDtddCache/SqliteDtddCache, but currently unused: staleness
+    /// is entirely owned by the IDtddCache implementation (CacheEntry.IsStale), and every DtddResult this class
+    /// returns reuses either the cache entry's FetchedAt or the inner client's own result.FetchedAt.
+    /// </param>
     public CachedDtddClient(IDtddClient inner, IDtddCache cache, CachePolicy? policy = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(inner);
@@ -45,20 +57,22 @@ public sealed class CachedDtddClient : IDtddClient
         _inner = inner;
         _cache = cache;
         _policy = policy ?? CachePolicy.Default;
-
-        // Accepted for constructor symmetry with InMemoryDtddCache/SqliteDtddCache (and so a future
-        // caller-visible clock read has an obvious place to live), but intentionally unused today: staleness
-        // is entirely owned by the IDtddCache implementation (CacheEntry.IsStale), and every DtddResult this
-        // class returns reuses either the cache entry's FetchedAt or the inner client's own result.FetchedAt.
-        _time = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
     public RateLimitStatus? CurrentBudget => _inner.CurrentBudget;
 
-    /// <inheritdoc />
+    private bool IsDisposed => Volatile.Read(ref _disposedFlag) != 0;
+
+    /// <summary>
+    /// Searches for items. A free-text query is passed straight through, uncached. An exact lookup
+    /// (imdb/tmdb/name) is cached by <em>first match</em>: once resolved to an item id, that mapping is treated
+    /// as permanent, and this method thereafter returns a one-element list sourced from the item's own cache
+    /// entry (see the class remarks) rather than re-searching.
+    /// </summary>
     public async Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         ArgumentNullException.ThrowIfNull(search);
 
         var key = LookupKey.FromSearch(search);
@@ -73,7 +87,10 @@ public sealed class CachedDtddClient : IDtddClient
         {
             var result = await _inner.SearchItemsAsync(search, ct).ConfigureAwait(false);
             var resolvedId = result.Value.Count > 0 ? result.Value[0].Id : (int?)null;
-            await _cache.PutLookupAsync(key, resolvedId, result.FetchedAt, ct).ConfigureAwait(false);
+
+            // CancellationToken.None: the response has already arrived (and cost real monthly budget), so the
+            // caller cancelling from here on must not stop it from being persisted (I1).
+            await _cache.PutLookupAsync(key, resolvedId, result.FetchedAt, CancellationToken.None).ConfigureAwait(false);
             return result;
         }
 
@@ -125,69 +142,89 @@ public sealed class CachedDtddClient : IDtddClient
         }
 
         var itemResult = await _inner.GetItemAsync(itemId, ct).ConfigureAwait(false);
-        await _cache.PutItemAsync(itemResult.Value, itemResult.FetchedAt, ct).ConfigureAwait(false);
+
+        // CancellationToken.None: see the comment on the miss branch above (I1).
+        await _cache.PutItemAsync(itemResult.Value, itemResult.FetchedAt, CancellationToken.None).ConfigureAwait(false);
         return new DtddResult<IReadOnlyList<Item>>([itemResult.Value], ResultSource.Live, itemResult.FetchedAt);
     }
 
     /// <inheritdoc />
-    public Task<DtddResult<ItemDetail>> GetItemAsync(int itemId, CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<ItemDetail>> GetItemAsync(int itemId, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             $"item:{itemId}",
             c => _cache.GetItemAsync(itemId, c),
             c => _inner.GetItemAsync(itemId, c),
             (value, fetchedAt, c) => _cache.PutItemAsync(value, fetchedAt, c),
             ct);
+    }
 
     /// <inheritdoc />
-    public Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsAsync(int itemId, int? topicId = null, CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsAsync(int itemId, int? topicId = null, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             topicId is { } id ? $"ratings:{itemId}:{id}" : $"ratings:{itemId}",
             c => _cache.GetRatingsAsync(itemId, topicId, c),
             c => _inner.GetRatingsAsync(itemId, topicId, c),
             (value, fetchedAt, c) => _cache.PutRatingsAsync(itemId, topicId, value, fetchedAt, c),
             ct);
+    }
 
     /// <inheritdoc />
-    public Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsAsync(CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsAsync(CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             "topics",
             c => _cache.GetTopicsAsync(c),
             c => _inner.GetTopicsAsync(c),
             (value, fetchedAt, c) => _cache.PutTopicsAsync(value, fetchedAt, c),
             ct);
+    }
 
     /// <inheritdoc />
-    public Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesAsync(CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesAsync(CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             "itemTypes",
             c => _cache.GetItemTypesAsync(c),
             c => _inner.GetItemTypesAsync(c),
             (value, fetchedAt, c) => _cache.PutItemTypesAsync(value, fetchedAt, c),
             ct);
+    }
 
     /// <inheritdoc />
-    public Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesAsync(CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesAsync(CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             "topicCategories",
             c => _cache.GetTopicCategoriesAsync(c),
             c => _inner.GetTopicCategoriesAsync(c),
             (value, fetchedAt, c) => _cache.PutTopicCategoriesAsync(value, fetchedAt, c),
             ct);
+    }
 
     /// <inheritdoc />
-    public Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesAsync(CancellationToken ct = default) =>
-        ReadThroughAsync(
+    public Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesAsync(CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        return ReadThroughAsync(
             "topicSuperCategories",
             c => _cache.GetTopicSuperCategoriesAsync(c),
             c => _inner.GetTopicSuperCategoriesAsync(c),
             (value, fetchedAt, c) => _cache.PutTopicSuperCategoriesAsync(value, fetchedAt, c),
             ct);
+    }
 
     /// <summary>
     /// The generic read-through pattern shared by every getter except <see cref="SearchItemsAsync"/> (which
-    /// has extra lookup-then-item indirection): cache miss calls inner and stores; a fresh hit is served from
-    /// cache; a stale hit is served from cache immediately, optionally kicking off a coalesced background
-    /// refresh.
+    /// has extra lookup-then-item indirection): cache miss calls inner and stores (coalesced per key, see
+    /// <see cref="FetchMissAsync{T}"/>); a fresh hit is served from cache; a stale hit is served from cache
+    /// immediately, optionally kicking off a coalesced background refresh.
     /// </summary>
     private async Task<DtddResult<T>> ReadThroughAsync<T>(
         string key,
@@ -199,12 +236,7 @@ public sealed class CachedDtddClient : IDtddClient
         var entry = await getCached(ct).ConfigureAwait(false);
         if (entry is null)
         {
-            var result = await fetchInner(ct).ConfigureAwait(false);
-            await put(result.Value, result.FetchedAt, ct).ConfigureAwait(false);
-
-            // Deliberately returned unchanged, Source and all: this was a genuine cache miss, so the inner
-            // client's own Source (Live) is exactly right and needs no relabeling.
-            return result;
+            return await FetchMissAsync(key, fetchInner, put, ct).ConfigureAwait(false);
         }
 
         if (!entry.IsStale)
@@ -218,6 +250,73 @@ public sealed class CachedDtddClient : IDtddClient
         }
 
         return new DtddResult<T>(entry.Value, ResultSource.StaleCache, entry.FetchedAt);
+    }
+
+    /// <summary>
+    /// Fetches a cache miss for <paramref name="key"/> and stores the result, coalescing concurrent misses for
+    /// the same key into a single inner call (I2): the shared fetch runs with <see cref="CancellationToken.None"/>
+    /// (it must not be torn down by whichever caller happens to have triggered it — other callers may still be
+    /// waiting on it), and each caller's own await is independently cancellable via <see cref="Task.WaitAsync(CancellationToken)"/>.
+    /// Unlike a background refresh, a miss is not fire-and-forget: an exception from the shared fetch propagates
+    /// to every waiting caller.
+    /// </summary>
+    private Task<DtddResult<T>> FetchMissAsync<T>(
+        string key,
+        Func<CancellationToken, Task<DtddResult<T>>> fetchInner,
+        Func<T, DateTimeOffset, CancellationToken, Task> put,
+        CancellationToken ct)
+    {
+        var missKey = $"miss:{key}";
+
+        Lazy<Task<object>> lazy = null!;
+        lazy = _inFlightMisses.GetOrAdd(
+            missKey,
+            _ =>
+            {
+                Lazy<Task<object>> l = null!;
+                l = new Lazy<Task<object>>(
+                    () => Task.Run(() => RunMissAsync(missKey, l, fetchInner, put)),
+                    LazyThreadSafetyMode.ExecutionAndPublication);
+                return l;
+            });
+
+        return AwaitMissAsync<T>(lazy.Value, ct);
+    }
+
+    private static async Task<DtddResult<T>> AwaitMissAsync<T>(Task<object> shared, CancellationToken ct)
+    {
+        var boxed = await shared.WaitAsync(ct).ConfigureAwait(false);
+        return (DtddResult<T>)boxed;
+    }
+
+    /// <summary>
+    /// Executes a single coalesced cache-miss fetch: fetches from the inner client, stores the result (both
+    /// with <see cref="CancellationToken.None"/> — see <see cref="FetchMissAsync{T}"/>), and returns it boxed
+    /// for <see cref="AwaitMissAsync{T}"/> to unwrap. Unlike <see cref="RunRefreshAsync{T}"/>, exceptions are
+    /// deliberately NOT swallowed: they must propagate to every caller awaiting this miss.
+    /// </summary>
+    private async Task<object> RunMissAsync<T>(
+        string key,
+        Lazy<Task<object>> self,
+        Func<CancellationToken, Task<DtddResult<T>>> fetchInner,
+        Func<T, DateTimeOffset, CancellationToken, Task> put)
+    {
+        try
+        {
+            var result = await fetchInner(CancellationToken.None).ConfigureAwait(false);
+            await put(result.Value, result.FetchedAt, CancellationToken.None).ConfigureAwait(false);
+
+            // Deliberately returned unchanged, Source and all: this was a genuine cache miss, so the inner
+            // client's own Source (Live) is exactly right and needs no relabeling.
+            return result;
+        }
+        finally
+        {
+            // Remove only the exact (key, lazy) pair this fetch registered itself under, so it can never
+            // remove a *different*, newer in-flight entry that has since replaced it for the same key (see the
+            // identical concern in RunRefreshAsync).
+            _inFlightMisses.TryRemove(new KeyValuePair<string, Lazy<Task<object>>>(key, self));
+        }
     }
 
     /// <summary>
@@ -290,6 +389,39 @@ public sealed class CachedDtddClient : IDtddClient
             // refresh can never remove a *different*, newer in-flight entry that has since replaced it for
             // the same key (e.g. after this one already finished and a fresh stale read started another).
             _inFlightRefreshes.TryRemove(new KeyValuePair<string, Lazy<Task>>(key, self));
+        }
+    }
+
+    /// <summary>
+    /// Marks this instance disposed (subsequent public calls throw <see cref="ObjectDisposedException"/>) and
+    /// awaits every in-flight background refresh and coalesced miss fetch, so that no such task outlives this
+    /// call. Exceptions from those tasks are swallowed: a refresh never faults by contract (see
+    /// <see cref="RunRefreshAsync{T}"/>), and a miss's fault is already propagating to its own caller(s) via
+    /// <see cref="AwaitMissAsync{T}"/> — disposal must not surface it a second time. Does NOT dispose
+    /// <c>inner</c> (passed to the constructor): ownership of the inner <see cref="IDtddClient"/> stays with
+    /// whoever constructed this instance.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposedFlag, 1) != 0)
+        {
+            return;
+        }
+
+        var pending = _inFlightRefreshes.Values.Select(l => l.Value)
+            .Concat(_inFlightMisses.Values.Select(l => (Task)l.Value))
+            .ToArray();
+
+        foreach (var task in pending)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Deliberately swallowed; see the XML remarks above.
+            }
         }
     }
 }
