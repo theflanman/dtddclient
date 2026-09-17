@@ -54,7 +54,7 @@ public sealed class SqliteDtddCacheTests : DtddCacheContractTests, IDisposable
         var entry = await second.GetItemAsync(item.Id);
 
         Assert.NotNull(entry);
-        Assert.Equal(item, entry!.Value);
+        AssertItemEquivalent(item, entry!.Value);
     }
 
     [Fact]

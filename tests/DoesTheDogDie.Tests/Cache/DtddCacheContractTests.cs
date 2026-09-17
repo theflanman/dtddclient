@@ -28,6 +28,33 @@ public abstract class DtddCacheContractTests
         ItemTypeName = "Movie",
     };
 
+    /// <summary>
+    /// Compares two <see cref="ItemDetail"/> values field by field rather than via record equality.
+    /// <see cref="ItemDetail"/>'s (and <see cref="Item"/>'s) compiler-synthesized <c>Equals</c> compares
+    /// <see cref="Item.Genres"/>/<see cref="ItemDetail.TopicItemStats"/> by reference, which a persistent
+    /// cache implementation can never satisfy since it always deserializes a fresh list. xUnit's
+    /// <see cref="Assert.Equal{T}(T, T)"/> does compare <see cref="Item.Genres"/> element-wise here
+    /// because its static type at the call site is <see cref="IReadOnlyList{T}"/> rather than a type with
+    /// its own <c>Equals</c> override. <see cref="TopicItemStat"/> is a sealed record with no collection
+    /// members, so its synthesized equality is trustworthy for the first-element spot check.
+    /// </summary>
+    protected static void AssertItemEquivalent(ItemDetail expected, ItemDetail actual)
+    {
+        Assert.Equal(expected.Id, actual.Id);
+        Assert.Equal(expected.Name, actual.Name);
+        Assert.Equal(expected.ItemTypeId, actual.ItemTypeId);
+        Assert.Equal(expected.ItemTypeName, actual.ItemTypeName);
+        Assert.Equal(expected.ImdbId, actual.ImdbId);
+        Assert.Equal(expected.TmdbId, actual.TmdbId);
+        Assert.Equal(expected.ReleaseYear, actual.ReleaseYear);
+        Assert.Equal(expected.Genres, actual.Genres);
+        Assert.Equal(expected.TopicItemStats.Count, actual.TopicItemStats.Count);
+        if (expected.TopicItemStats.Count > 0)
+        {
+            Assert.Equal(expected.TopicItemStats[0], actual.TopicItemStats[0]);
+        }
+    }
+
     private static Rating MakeRating(int id, int itemId, int topicId) => new()
     {
         Id = id,
@@ -53,7 +80,7 @@ public abstract class DtddCacheContractTests
         var entry = await cache.GetItemAsync(item.Id);
 
         Assert.NotNull(entry);
-        Assert.Equal(item, entry!.Value);
+        AssertItemEquivalent(item, entry!.Value);
         Assert.False(entry.IsStale);
     }
 
@@ -87,7 +114,7 @@ public abstract class DtddCacheContractTests
         var staleEntry = await cache.GetItemAsync(item.Id);
         Assert.NotNull(staleEntry);
         Assert.True(staleEntry!.IsStale);
-        Assert.Equal(item, staleEntry.Value);
+        AssertItemEquivalent(item, staleEntry.Value);
     }
 
     [Fact]
