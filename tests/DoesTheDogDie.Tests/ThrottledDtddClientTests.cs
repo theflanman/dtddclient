@@ -269,9 +269,17 @@ public class ThrottledDtddClientTests
         var (fake, time, client) = CreateSut();
         await using var _ = client;
 
+        // The 429 carries MonthRemaining: 0, exactly like a real monthly-exhausted response: this is what
+        // previously left the client permanently wedged (C1), because the reserve check (which consults the
+        // last-observed MonthRemaining, not _exhaustedUntil) kept tripping forever, even after the configured
+        // reset time passed, since nothing ever cleared the stale figure.
         fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(
             new DtddMonthlyRateLimitException(
-                HttpStatusCode.TooManyRequests, "monthly_limit_exceeded", "out of budget", null, null));
+                HttpStatusCode.TooManyRequests,
+                "monthly_limit_exceeded",
+                "out of budget",
+                new RateLimitStatus(30, 0, 5000, 0, time.GetUtcNow()),
+                null));
 
         await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => client.GetTopicsAsync());
 
@@ -286,6 +294,42 @@ public class ThrottledDtddClientTests
 
         var result = await client.GetTopicCategoriesAsync();
         Assert.Equal(ResultSource.Live, result.Source);
+    }
+
+    [Fact]
+    public async Task Reserve_RecoversAfterMonthReset()
+    {
+        // C1 regression test: the reserve check (ThrottleOptions.MonthlyReserve) trips purely off the
+        // last-observed MonthRemaining header, without ever setting _exhaustedUntil itself, and without
+        // ever getting a fresh header to replace the stale one (since it never lets a request through). Both
+        // halves of the fix are exercised here: the reserve trip must arm the same exhaustion clock as a real
+        // 429, and once that clock passes, the stale MonthRemaining must be cleared so exactly one probe
+        // request can go out and re-seed the budget.
+        var (fake, time, client) = CreateSut(new ThrottleOptions { MonthlyReserve = 0 });
+        await using var _ = client;
+
+        fake.NextRateLimit = new RateLimitStatus(30, 30, 5000, 0, time.GetUtcNow());
+        var first = await client.GetTopicsAsync();
+        Assert.Equal(ResultSource.Live, first.Source);
+        Assert.Equal(0, client.CurrentBudget?.MonthRemaining);
+
+        // Reserve is exhausted: the next call must fail without ever reaching the inner client.
+        await Assert.ThrowsAsync<DtddMonthlyRateLimitException>(() => client.GetItemTypesAsync());
+        Assert.DoesNotContain("ItemTypes", fake.Calls);
+
+        var resetAt = ThrottleOptions.NextUtcMonthStart(time.GetUtcNow());
+        time.Advance(resetAt - time.GetUtcNow());
+
+        // Past reset, the stale figure must be cleared so this call reaches the inner client and succeeds.
+        fake.NextRateLimit = new RateLimitStatus(30, 30, 5000, 4999, time.GetUtcNow());
+        var second = await client.GetItemTypesAsync();
+        Assert.Equal(ResultSource.Live, second.Source);
+        Assert.Contains("ItemTypes", fake.Calls);
+        Assert.Equal(4999, client.CurrentBudget?.MonthRemaining);
+
+        // The freshly re-seeded budget (well above the reserve) must let subsequent calls proceed normally.
+        var third = await client.GetTopicCategoriesAsync();
+        Assert.Equal(ResultSource.Live, third.Source);
     }
 
     [Fact]

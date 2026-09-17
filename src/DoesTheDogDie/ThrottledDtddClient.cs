@@ -347,25 +347,25 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// </summary>
     private bool TryGetMonthlyExhaustedException(out DtddMonthlyRateLimitException exception)
     {
+        var now = _timeProvider.GetUtcNow();
         DateTimeOffset? exhaustedUntil;
+        RateLimitStatus? budget;
         lock (_stateLock)
         {
+            ClearExpiredExhaustionLocked(now);
             exhaustedUntil = _exhaustedUntil;
+            budget = _currentBudget;
         }
 
-        if (exhaustedUntil is { } until)
+        if (exhaustedUntil is { } until && now < until)
         {
-            var now = _timeProvider.GetUtcNow();
-            if (now < until)
-            {
-                exception = new DtddMonthlyRateLimitException(
-                    HttpStatusCode.TooManyRequests,
-                    "monthly_limit_exceeded",
-                    "Monthly request budget exhausted.",
-                    CurrentBudget,
-                    ClampNonNegative(until - now));
-                return true;
-            }
+            exception = new DtddMonthlyRateLimitException(
+                HttpStatusCode.TooManyRequests,
+                "monthly_limit_exceeded",
+                "Monthly request budget exhausted.",
+                budget,
+                ClampNonNegative(until - now));
+            return true;
         }
 
         exception = null!;
@@ -377,13 +377,31 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// <see cref="RateLimitStatus.MonthRemaining"/>, without making a request. Returns true (with an
     /// exception ready to fail the job) if sending now would dip into the reserve.
     /// </summary>
+    /// <remarks>
+    /// C1 fix: tripping this check now arms <see cref="_exhaustedUntil"/> exactly like a real monthly 429
+    /// would (via <see cref="HandleMonthlyExhaustion"/>). Without that, a reserve trip never let a request
+    /// through again — the only way <see cref="_currentBudget"/> could change was a response actually
+    /// arriving, which the reserve check itself was permanently blocking, regardless of how much wall-clock
+    /// time (including month rollovers) passed.
+    /// </remarks>
     private bool TryGetReserveExhaustedException(out DtddMonthlyRateLimitException exception)
     {
-        var budget = CurrentBudget;
+        var now = _timeProvider.GetUtcNow();
+        RateLimitStatus? budget;
+        lock (_stateLock)
+        {
+            ClearExpiredExhaustionLocked(now);
+            budget = _currentBudget;
+        }
+
         if (budget is { MonthRemaining: { } remaining } && remaining - _options.MonthlyReserve <= 0)
         {
-            var now = _timeProvider.GetUtcNow();
             var until = _options.MonthResetRule(now);
+            lock (_stateLock)
+            {
+                _exhaustedUntil = until;
+            }
+
             exception = new DtddMonthlyRateLimitException(
                 HttpStatusCode.TooManyRequests,
                 "monthly_limit_exceeded",
@@ -395,6 +413,24 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         exception = null!;
         return false;
+    }
+
+    /// <summary>
+    /// If the exhaustion clock has passed, clears it along with the stale <see cref="RateLimitStatus.MonthRemaining"/>
+    /// figure that armed it (keeping <see cref="RateLimitStatus.MonthLimit"/> and the other fields), so exactly
+    /// one probe request is allowed out to re-seed the budget from real headers. Must be called while holding
+    /// <see cref="_stateLock"/>.
+    /// </summary>
+    private void ClearExpiredExhaustionLocked(DateTimeOffset now)
+    {
+        if (_exhaustedUntil is { } until && now >= until)
+        {
+            _exhaustedUntil = null;
+            if (_currentBudget is { } budget)
+            {
+                _currentBudget = budget with { MonthRemaining = null };
+            }
+        }
     }
 
     /// <summary>
