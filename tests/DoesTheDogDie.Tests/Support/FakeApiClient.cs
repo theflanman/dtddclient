@@ -77,6 +77,7 @@ internal sealed class FakeApiClient : IDtddApiClient
 
     private async Task RecordAndMaybeThrowAsync(string call, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(call);
         if (BeforeRespond is { } hook)
         {
