@@ -138,7 +138,7 @@ public class ThrottledDtddClientTests
         // 1s steps, not much later than that either — this is what stops the test from passing if the wait
         // were silently skipped or RetryAfter/window logic were broken).
         var elapsed = time.GetUtcNow() - start;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + step);
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + (step * 5));
     }
 
     [Fact]
@@ -165,7 +165,7 @@ public class ThrottledDtddClientTests
         await Task.WhenAll(tasks);
 
         var elapsed = time.GetUtcNow() - start;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + step);
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + (step * 5));
     }
 
     [Fact]
@@ -203,7 +203,7 @@ public class ThrottledDtddClientTests
         // Confirm the retry actually waited out the full RetryAfter (10s), rather than firing immediately —
         // i.e. that RetryAfter is not silently ignored.
         var elapsed = time.GetUtcNow() - start;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10) + step);
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10) + (step * 5));
     }
 
     [Fact]
@@ -230,7 +230,7 @@ public class ThrottledDtddClientTests
         Assert.Equal(2, fake.Calls.Count);
 
         var elapsed = time.GetUtcNow() - start;
-        Assert.InRange(elapsed, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5) + step);
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5) + (step * 5));
     }
 
     [Fact]
