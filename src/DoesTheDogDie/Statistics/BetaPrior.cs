@@ -6,7 +6,7 @@ namespace DoesTheDogDie.Statistics;
 /// </summary>
 public readonly record struct BetaPrior
 {
-    public BetaPrior(double alpha, double beta)
+    public BetaPrior(UInt64 alpha, UInt64 beta)
     {
         if (alpha <= 0)
         {
@@ -22,13 +22,11 @@ public readonly record struct BetaPrior
         Beta = beta;
     }
 
-    public double Alpha { get; }
+    public UInt64 Alpha { get; }
 
-    public double Beta { get; }
+    public UInt64 Beta { get; }
 
     /// <summary>The uninformative Beta(1, 1) uniform prior.</summary>
     public static BetaPrior Uniform => new(1, 1);
-
-    /// <summary>The Jeffreys Beta(0.5, 0.5) prior.</summary>
-    public static BetaPrior Jeffreys => new(0.5, 0.5);
+    
 }

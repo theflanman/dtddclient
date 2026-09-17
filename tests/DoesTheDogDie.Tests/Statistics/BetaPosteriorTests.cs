@@ -16,15 +16,6 @@ public class BetaPosteriorTests
     }
 
     [Fact]
-    public void FromCounts_Jeffreys()
-    {
-        var posterior = BetaPosterior.FromCounts(57, 3, BetaPrior.Jeffreys);
-
-        Assert.Equal(57.5, posterior.Alpha, 1e-12);
-        Assert.Equal(3.5, posterior.Beta, 1e-12);
-    }
-
-    [Fact]
     public void Mean()
     {
         var posterior = BetaPosterior.FromCounts(57, 3);
@@ -97,17 +88,9 @@ public class BetaPriorTests
     }
 
     [Fact]
-    public void Jeffreys_IsHalfHalf()
-    {
-        Assert.Equal(0.5, BetaPrior.Jeffreys.Alpha);
-        Assert.Equal(0.5, BetaPrior.Jeffreys.Beta);
-    }
-
-    [Fact]
     public void NonPositive_Throws()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new BetaPrior(0, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => new BetaPrior(1, 0));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new BetaPrior(-1, 1));
     }
 }

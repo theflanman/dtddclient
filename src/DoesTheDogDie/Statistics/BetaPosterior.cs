@@ -10,14 +10,14 @@ namespace DoesTheDogDie.Statistics;
 /// </remarks>
 public readonly record struct BetaPosterior
 {
-    public BetaPosterior(double alpha, double beta)
+    public BetaPosterior(UInt64 alpha, UInt64 beta)
     {
-        if (alpha <= 0)
+        if (alpha == 0)
         {
             throw new ArgumentOutOfRangeException(nameof(alpha), alpha, "Alpha must be positive.");
         }
 
-        if (beta <= 0)
+        if (beta == 0)
         {
             throw new ArgumentOutOfRangeException(nameof(beta), beta, "Beta must be positive.");
         }
@@ -26,9 +26,9 @@ public readonly record struct BetaPosterior
         Beta = beta;
     }
 
-    public double Alpha { get; }
+    public UInt64 Alpha { get; }
 
-    public double Beta { get; }
+    public UInt64 Beta { get; }
 
     /// <summary>
     /// Builds the posterior from observed yes/no vote counts and a prior (defaults to uniform).
@@ -47,10 +47,10 @@ public readonly record struct BetaPosterior
 
         var effectivePrior = prior ?? BetaPrior.Uniform;
 
-        return new BetaPosterior(effectivePrior.Alpha + yes, effectivePrior.Beta + no);
+        return new BetaPosterior(effectivePrior.Alpha + (UInt64) yes, effectivePrior.Beta + (UInt64) no);
     }
 
-    public double Mean => Alpha / (Alpha + Beta);
+    public double Mean => ((double) Alpha)/((double) (Alpha + Beta)) ;
 
     public double Variance
     {

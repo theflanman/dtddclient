@@ -23,31 +23,29 @@ internal static class BetaFunctions
     };
 
     /// <summary>
-    /// Natural logarithm of the Gamma function, via the Lanczos approximation.
+    /// Natural logarithm of the Gamma function.
     /// </summary>
-    public static double LogGamma(double x)
+    public static double LogGamma(UInt64 x)
     {
-        if (x < 0.5)
+        if (x == 0)
         {
-            // Reflection formula: Gamma(x) * Gamma(1-x) = pi / sin(pi*x)
-            return Math.Log(Math.PI / Math.Sin(Math.PI * x)) - LogGamma(1.0 - x);
+            return double.PositiveInfinity;
         }
 
-        x -= 1.0;
-        double a = LanczosCoefficients[0];
-        double t = x + LanczosG + 0.5;
-        for (int i = 1; i < LanczosCoefficients.Length; i++)
-        {
-            a += LanczosCoefficients[i] / (x + i);
-        }
+        double output = 0;
 
-        return 0.5 * Math.Log(2 * Math.PI) + (x + 0.5) * Math.Log(t) - t + Math.Log(a);
+        for (UInt64 i = 1; i < x; i++)
+        {
+            output += Math.Log(i);
+        }
+        
+        return output;
     }
 
     /// <summary>
     /// Natural logarithm of the Beta function: ln B(a, b) = ln Gamma(a) + ln Gamma(b) - ln Gamma(a+b).
     /// </summary>
-    public static double LogBeta(double a, double b)
+    public static double LogBeta(UInt64 a, UInt64 b)
     {
         return LogGamma(a) + LogGamma(b) - LogGamma(a + b);
     }
@@ -55,7 +53,7 @@ internal static class BetaFunctions
     /// <summary>
     /// The regularized incomplete beta function I_x(a, b), the CDF of the Beta(a, b) distribution at x.
     /// </summary>
-    public static double RegularizedIncompleteBeta(double a, double b, double x)
+    public static double RegularizedIncompleteBeta(UInt64 a, UInt64 b, double x)
     {
         if (a <= 0)
         {
@@ -168,7 +166,7 @@ internal static class BetaFunctions
     /// Inverse of the regularized incomplete beta function: solves I_x(a, b) = p for x,
     /// i.e. the quantile function of the Beta(a, b) distribution.
     /// </summary>
-    public static double InverseRegularizedIncompleteBeta(double a, double b, double p)
+    public static double InverseRegularizedIncompleteBeta(UInt64 a, UInt64 b, double p)
     {
         if (a <= 0)
         {
