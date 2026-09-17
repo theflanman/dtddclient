@@ -18,12 +18,13 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly Task _loopTask;
     private readonly Lock _stateLock = new();
+    private readonly TaskCompletionSource _disposeCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private readonly Queue<DateTimeOffset> _sendTimestamps = new();
 
     private RateLimitStatus? _currentBudget;
     private DateTimeOffset? _exhaustedUntil;
-    private bool _disposed;
+    private int _disposedFlag;
 
     public ThrottledDtddClient(IDtddApiClient inner, ThrottleOptions? options = null, TimeProvider? timeProvider = null)
     {
@@ -47,6 +48,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             }
         }
     }
+
+    private bool IsDisposed => Volatile.Read(ref _disposedFlag) != 0;
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
@@ -88,7 +91,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private Task<DtddResult<T>> EnqueueAsync<T>(
         string name, Func<CancellationToken, Task<ApiResponse<T>>> call, CancellationToken ct)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         ThrowIfMonthlyExhausted();
 
         var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -114,6 +117,15 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         if (!_channel.Writer.TryWrite(job))
         {
             registration.Dispose();
+
+            // TryWrite fails either because the channel is full, or because the writer was completed by
+            // DisposeAsync racing with this call. Distinguish them so a caller doesn't see a misleading
+            // "queue full" for what is actually shutdown.
+            if (IsDisposed)
+            {
+                throw new ObjectDisposedException(nameof(ThrottledDtddClient));
+            }
+
             throw new DtddQueueFullException(_options.MaxQueueLength);
         }
 
@@ -164,6 +176,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             return;
         }
 
+        if (TryGetMonthlyExhaustedException(out var exhaustedException))
+        {
+            job.Completion.TrySetException(exhaustedException);
+            return;
+        }
+
         if (TryGetReserveExhaustedException(out var reserveException))
         {
             job.Completion.TrySetException(reserveException);
@@ -172,59 +190,71 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
 
-        // Two attempts total: the original send, plus one retry after a minute-limit Retry-After wait.
-        for (var attempt = 0; attempt < 2; attempt++)
+        try
         {
-            try
+            // Two attempts total: the original send, plus one retry after a minute-limit Retry-After wait.
+            // The retry delay below deliberately lives OUTSIDE the inner try/catch (and thus is covered by
+            // the single outer try/catch/finally below): a prior version awaited it inside the
+            // DtddMinuteRateLimitException catch clause, guarded only by a catch for the caller's own
+            // cancellation, so an OperationCanceledException from _shutdownCts (disposal) — or any other
+            // exception, e.g. a negative RetryAfter reaching Task.Delay — escaped uncaught, left the job's
+            // TaskCompletionSource unset, and (for anything but OCE) took the whole consumer loop down with it.
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                await WaitForMinuteWindowAsync(linked.Token).ConfigureAwait(false);
-                var result = await job.Execute(linked.Token).ConfigureAwait(false);
-                job.Completion.TrySetResult(result);
-                return;
-            }
-            catch (DtddMinuteRateLimitException ex)
-            {
-                UpdateBudget(ex.RateLimit);
+                DtddMinuteRateLimitException? minuteException = null;
 
-                if (attempt == 0)
+                try
                 {
-                    try
-                    {
-                        await Task.Delay(ex.RetryAfter ?? TimeSpan.FromSeconds(60), _timeProvider, linked.Token)
-                            .ConfigureAwait(false);
-
-                        continue;
-                    }
-                    catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
-                    {
-                        job.Completion.TrySetCanceled(job.Token);
-                        return;
-                    }
+                    await WaitForMinuteWindowAsync(linked.Token).ConfigureAwait(false);
+                    var result = await job.Execute(linked.Token).ConfigureAwait(false);
+                    job.Completion.TrySetResult(result);
+                    return;
+                }
+                catch (DtddMinuteRateLimitException ex)
+                {
+                    UpdateBudget(ex.RateLimit);
+                    minuteException = ex;
+                }
+                catch (DtddMonthlyRateLimitException ex)
+                {
+                    HandleMonthlyExhaustion(ex, job);
+                    return;
                 }
 
-                job.Completion.TrySetException(ex);
-                return;
-            }
-            catch (DtddMonthlyRateLimitException ex)
-            {
-                HandleMonthlyExhaustion(ex, job);
-                return;
-            }
-            catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
-            {
-                job.Completion.TrySetCanceled(job.Token);
-                return;
-            }
-            catch (Exception ex)
-            {
-                if (ex is DtddApiException apiEx)
+                if (attempt == 1)
                 {
-                    UpdateBudget(apiEx.RateLimit);
+                    job.Completion.TrySetException(minuteException!);
+                    return;
                 }
 
-                job.Completion.TrySetException(ex);
-                return;
+                var delay = ClampNonNegative(minuteException!.RetryAfter ?? TimeSpan.FromSeconds(60));
+                await Task.Delay(delay, _timeProvider, linked.Token).ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
+        {
+            job.Completion.TrySetCanceled(job.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Caused by _shutdownCts (disposal), not the caller's own token: report it the same way as a
+            // job that was still sitting in the queue when disposal drained it (see M3 / RunLoopAsync above).
+            job.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
+        }
+        catch (Exception ex)
+        {
+            if (ex is DtddApiException apiEx)
+            {
+                UpdateBudget(apiEx.RateLimit);
+            }
+
+            job.Completion.TrySetException(ex);
+        }
+        finally
+        {
+            // Absolute backstop: whatever happened above, never leave the caller's Task pending forever.
+            // A no-op if the job was already completed (success, cancellation, or a specific failure) above.
+            job.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
         }
     }
 
@@ -236,7 +266,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     {
         while (true)
         {
-            var limit = CurrentBudget?.MinuteLimit ?? _options.DefaultMinuteLimit;
+            var limit = GetEffectiveMinuteLimit();
             var now = _timeProvider.GetUtcNow();
 
             while (_sendTimestamps.Count > 0 && now - _sendTimestamps.Peek() >= TimeSpan.FromSeconds(60))
@@ -258,6 +288,24 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// The per-minute limit to pace against: the last-observed header value, unless it is missing or
+    /// non-positive (e.g. a header literally reading <c>0</c>, which parses as <c>0</c> rather than null), in
+    /// which case <see cref="ThrottleOptions.DefaultMinuteLimit"/> is used (falling back to <c>1</c> if that
+    /// too is non-positive). Without this guard a non-positive limit would make the sliding window's
+    /// <c>Count &lt; limit</c> check permanently false, spinning forever on an empty queue.
+    /// </summary>
+    private int GetEffectiveMinuteLimit()
+    {
+        var headerLimit = CurrentBudget?.MinuteLimit;
+        if (headerLimit is { } limit && limit > 0)
+        {
+            return limit;
+        }
+
+        return _options.DefaultMinuteLimit > 0 ? _options.DefaultMinuteLimit : 1;
+    }
+
     private void UpdateBudget(RateLimitStatus? rateLimit)
     {
         if (rateLimit is null)
@@ -277,29 +325,43 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// </summary>
     private void ThrowIfMonthlyExhausted()
     {
+        if (TryGetMonthlyExhaustedException(out var exception))
+        {
+            throw exception;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether the monthly budget is known to be exhausted until some future instant. Called both at
+    /// enqueue time (<see cref="ThrowIfMonthlyExhausted"/>) and again at dequeue time from
+    /// <see cref="ProcessJobAsync"/>, because a call can pass the enqueue-time check and still land in the
+    /// channel after a concurrent <see cref="HandleMonthlyExhaustion"/> has already drained it.
+    /// </summary>
+    private bool TryGetMonthlyExhaustedException(out DtddMonthlyRateLimitException exception)
+    {
         DateTimeOffset? exhaustedUntil;
         lock (_stateLock)
         {
             exhaustedUntil = _exhaustedUntil;
         }
 
-        if (exhaustedUntil is not { } until)
+        if (exhaustedUntil is { } until)
         {
-            return;
+            var now = _timeProvider.GetUtcNow();
+            if (now < until)
+            {
+                exception = new DtddMonthlyRateLimitException(
+                    HttpStatusCode.TooManyRequests,
+                    "monthly_limit_exceeded",
+                    "Monthly request budget exhausted.",
+                    CurrentBudget,
+                    ClampNonNegative(until - now));
+                return true;
+            }
         }
 
-        var now = _timeProvider.GetUtcNow();
-        if (now >= until)
-        {
-            return;
-        }
-
-        throw new DtddMonthlyRateLimitException(
-            HttpStatusCode.TooManyRequests,
-            "monthly_limit_exceeded",
-            "Monthly request budget exhausted.",
-            CurrentBudget,
-            until - now);
+        exception = null!;
+        return false;
     }
 
     /// <summary>
@@ -315,7 +377,11 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             var now = _timeProvider.GetUtcNow();
             var until = _options.MonthResetRule(now);
             exception = new DtddMonthlyRateLimitException(
-                HttpStatusCode.TooManyRequests, "monthly_limit_exceeded", "Monthly reserve reached", budget, until - now);
+                HttpStatusCode.TooManyRequests,
+                "monthly_limit_exceeded",
+                "Monthly reserve reached",
+                budget,
+                ClampNonNegative(until - now));
             return true;
         }
 
@@ -342,38 +408,49 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         while (_channel.Reader.TryRead(out var queued))
         {
-            var retryAfter = until - _timeProvider.GetUtcNow();
             queued.Completion.TrySetException(new DtddMonthlyRateLimitException(
                 ex.StatusCode,
                 ex.ErrorCode,
                 ex.Message,
                 CurrentBudget,
-                retryAfter > TimeSpan.Zero ? retryAfter : TimeSpan.Zero));
+                ClampNonNegative(until - _timeProvider.GetUtcNow())));
         }
     }
+
+    private static TimeSpan ClampNonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposedFlag, 1, 0) != 0)
         {
+            // Someone else is already disposing (or already finished); await the same outcome instead of
+            // racing on _shutdownCts/_loopTask ourselves.
+            await _disposeCompletion.Task.ConfigureAwait(false);
             return;
         }
 
-        _disposed = true;
-        _channel.Writer.TryComplete();
-        await _shutdownCts.CancelAsync().ConfigureAwait(false);
-
         try
         {
-            await _loopTask.ConfigureAwait(false);
-        }
-        catch
-        {
-            // The loop swallows its own per-job failures; this is a defensive backstop.
-        }
+            _channel.Writer.TryComplete();
+            await _shutdownCts.CancelAsync().ConfigureAwait(false);
 
-        _shutdownCts.Dispose();
+            try
+            {
+                await _loopTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected: the loop's channel read observes _shutdownCts and unwinds via this exception.
+                // Anything else escaping the loop is a genuine bug and should surface, not be swallowed.
+            }
+
+            _shutdownCts.Dispose();
+        }
+        finally
+        {
+            _disposeCompletion.TrySetResult();
+        }
     }
 
     /// <summary>A unit of queued work: a wrapped API call plus the plumbing to report its outcome.</summary>

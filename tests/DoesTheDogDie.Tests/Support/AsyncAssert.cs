@@ -9,15 +9,16 @@ internal static class AsyncAssert
 {
     /// <summary>
     /// Repeatedly yields and checks <paramref name="condition"/> until it is true or
-    /// <paramref name="maxIterations"/> is reached. Returns whether the condition became true.
+    /// <paramref name="maxIterations"/> is reached, in which case it fails the test (an unmet condition here
+    /// is a real regression, not something a caller should be able to silently ignore by discarding a bool).
     /// </summary>
-    public static async Task<bool> WaitUntilAsync(Func<bool> condition, int maxIterations = 1000)
+    public static async Task WaitUntilAsync(Func<bool> condition, int maxIterations = 1000)
     {
         for (var i = 0; i < maxIterations; i++)
         {
             if (condition())
             {
-                return true;
+                return;
             }
 
             // A bare Task.Yield() reschedules onto the calling thread's local queue with priority, which can
@@ -28,7 +29,10 @@ internal static class AsyncAssert
             await Task.Delay(1).ConfigureAwait(false);
         }
 
-        return condition();
+        if (!condition())
+        {
+            Assert.Fail($"Condition not met after {maxIterations} iterations.");
+        }
     }
 
     /// <summary>
@@ -55,6 +59,11 @@ internal static class AsyncAssert
 
             time.Advance(step);
             await Task.Delay(1).ConfigureAwait(false);
+        }
+
+        if (!condition())
+        {
+            Assert.Fail($"Condition not met after {maxIterations} iterations (advancing by {step} each time).");
         }
     }
 }

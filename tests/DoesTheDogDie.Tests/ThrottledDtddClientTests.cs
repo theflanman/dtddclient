@@ -78,12 +78,10 @@ public class ThrottledDtddClientTests
 
         await client.DisposeAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => firstTask);
-
-        var secondException = await Record.ExceptionAsync(() => secondTask);
-        Assert.True(
-            secondException is OperationCanceledException or ObjectDisposedException,
-            $"Expected cancellation or disposal, got {secondException?.GetType()}");
+        // Both the in-flight job and the still-queued job must fail the same way: ObjectDisposedException,
+        // regardless of whether disposal caught them mid-flight or drained them from the channel.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => firstTask);
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => secondTask);
     }
 
     [Fact]
@@ -130,9 +128,17 @@ public class ThrottledDtddClientTests
 
         Assert.Equal(30, fake.Calls.Count);
 
-        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(60), () => fake.Calls.Count == 31);
+        var start = time.GetUtcNow();
+        var step = TimeSpan.FromSeconds(1);
+        await AsyncAssert.WaitUntilAsync(time, step, () => fake.Calls.Count == 31);
         await Task.WhenAll(tasks);
         Assert.Equal(31, fake.Calls.Count);
+
+        // The 31st call must not be served before a full 60s minute window has elapsed (and, since we poll in
+        // 1s steps, not much later than that either — this is what stops the test from passing if the wait
+        // were silently skipped or RetryAfter/window logic were broken).
+        var elapsed = time.GetUtcNow() - start;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + step);
     }
 
     [Fact]
@@ -153,8 +159,13 @@ public class ThrottledDtddClientTests
 
         Assert.Equal(5, fake.Calls.Count);
 
-        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(60), () => fake.Calls.Count == 6);
+        var start = time.GetUtcNow();
+        var step = TimeSpan.FromSeconds(1);
+        await AsyncAssert.WaitUntilAsync(time, step, () => fake.Calls.Count == 6);
         await Task.WhenAll(tasks);
+
+        var elapsed = time.GetUtcNow() - start;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60) + step);
     }
 
     [Fact]
@@ -182,10 +193,17 @@ public class ThrottledDtddClientTests
         // A single time.Advance(10s) call only fires a retry-after timer that already exists; the background
         // consumer registers that timer asynchronously relative to this thread, so advance repeatedly (see
         // AsyncAssert.WaitUntilAsync(FakeTimeProvider, ...) for why a single call is not reliable here).
-        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(10), () => task.IsCompleted);
+        var start = time.GetUtcNow();
+        var step = TimeSpan.FromSeconds(1);
+        await AsyncAssert.WaitUntilAsync(time, step, () => task.IsCompleted);
         await task;
 
         Assert.Equal(2, fake.Calls.Count);
+
+        // Confirm the retry actually waited out the full RetryAfter (10s), rather than firing immediately —
+        // i.e. that RetryAfter is not silently ignored.
+        var elapsed = time.GetUtcNow() - start;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10) + step);
     }
 
     [Fact]
@@ -204,10 +222,15 @@ public class ThrottledDtddClientTests
 
         // See the comment in Minute429_PausesForRetryAfterThenRetries for why a single Advance() call is not
         // reliable here.
-        await AsyncAssert.WaitUntilAsync(time, TimeSpan.FromSeconds(5), () => fake.Calls.Count == 2);
+        var start = time.GetUtcNow();
+        var step = TimeSpan.FromSeconds(1);
+        await AsyncAssert.WaitUntilAsync(time, step, () => fake.Calls.Count == 2);
 
         await Assert.ThrowsAsync<DtddMinuteRateLimitException>(() => task);
         Assert.Equal(2, fake.Calls.Count);
+
+        var elapsed = time.GetUtcNow() - start;
+        Assert.InRange(elapsed, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5) + step);
     }
 
     [Fact]
@@ -318,5 +341,80 @@ public class ThrottledDtddClientTests
 
         await firstTask;
         await secondTask;
+    }
+
+    [Fact]
+    public async Task Dispose_DuringRetryAfterWait_FailsJob()
+    {
+        // C1 regression test: disposing while a job is inside its Retry-After wait must fail that job rather
+        // than leaving its Task pending forever. Previously the retry delay lived inside a catch clause
+        // guarded only by "the caller's own token was cancelled"; an OperationCanceledException coming from
+        // _shutdownCts instead (i.e. disposal) escaped uncaught and never touched the job's TaskCompletionSource.
+        var (fake, _, client) = CreateSut();
+
+        fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(
+            new DtddMinuteRateLimitException(
+                HttpStatusCode.TooManyRequests, "rate_limit_exceeded", "slow down", null, TimeSpan.FromSeconds(30)));
+
+        var task = client.GetTopicsAsync();
+
+        await AsyncAssert.WaitUntilAsync(() => fake.Calls.Count == 1);
+
+        // Give the background loop a moment to run the fully synchronous chain from "first attempt failed"
+        // through "retry-after Task.Delay registered" (there is no observable signal for that point; this is
+        // a scheduling nudge, not a business-logic wait — disposal is correct regardless of whether it lands
+        // before or after this point, since every await in ProcessJobAsync uses the same linked token).
+        await Task.Delay(20);
+
+        await client.DisposeAsync();
+
+        var exception = await Record.ExceptionAsync(() => task);
+        Assert.IsType<ObjectDisposedException>(exception);
+    }
+
+    [Fact]
+    public async Task NegativeRetryAfter_DoesNotKillLoop()
+    {
+        // I1 regression test: a negative RetryAfter must not propagate an unhandled ArgumentOutOfRangeException
+        // out of Task.Delay and take the whole consumer loop down with it (which would hang every other job,
+        // including ones enqueued afterward).
+        var (fake, _, client) = CreateSut();
+        await using var _ = client;
+
+        fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(
+            new DtddMinuteRateLimitException(
+                HttpStatusCode.TooManyRequests, "rate_limit_exceeded", "slow down", null, TimeSpan.FromSeconds(-5)));
+
+        var firstTask = client.GetTopicsAsync();
+
+        // Negative RetryAfter clamps to zero, so the retry happens immediately; the fake keeps throwing, so
+        // the second (and final) attempt fails the same way.
+        var firstException = await Record.ExceptionAsync(() => firstTask);
+        Assert.IsType<DtddMinuteRateLimitException>(firstException);
+
+        // The loop must still be alive: a subsequent call is processed normally.
+        fake.BeforeRespond = null;
+        var secondResult = await client.GetItemTypesAsync();
+        Assert.Equal(ResultSource.Live, secondResult.Source);
+    }
+
+    [Fact]
+    public async Task MinuteLimitZero_FallsBackToDefault()
+    {
+        // M2 regression test: a header reporting MinuteLimit 0 parses as 0, not null, so a naive
+        // "?? DefaultMinuteLimit" does nothing. Without a guard, the sliding window's "count < limit" check
+        // is permanently false against an empty window, and WaitForMinuteWindowAsync spins forever on
+        // Peek() of an empty queue.
+        var (fake, _, client) = CreateSut();
+        await using var _ = client;
+
+        fake.NextRateLimit = new RateLimitStatus(0, 0, 5000, 5000, StartTime);
+
+        var first = await client.GetTopicsAsync();
+        Assert.Equal(ResultSource.Live, first.Source);
+        Assert.Equal(0, client.CurrentBudget?.MinuteLimit);
+
+        var second = await client.GetItemTypesAsync();
+        Assert.Equal(ResultSource.Live, second.Source);
     }
 }
