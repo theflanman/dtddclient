@@ -10,8 +10,25 @@ namespace DoesTheDogDie.Tests.Support;
 /// </summary>
 internal sealed class FakeDtddClient : IDtddClient
 {
-    /// <summary>Short descriptions of each call made, in order (e.g. "GetItem:10752", "Search:?imdb=tt123").</summary>
-    public List<string> Calls { get; } = [];
+    private readonly Lock _callsLock = new();
+    private readonly List<string> _calls = [];
+
+    /// <summary>
+    /// Short descriptions of each call made, in order (e.g. "GetItem:10752", "Search:?imdb=tt123"). Calls can
+    /// arrive from a background-refresh pool thread (<c>CachedDtddClient</c>'s fire-and-forget refreshes)
+    /// concurrently with a test thread reading this property, so each read takes a lock-protected snapshot
+    /// rather than exposing the backing list directly.
+    /// </summary>
+    public IReadOnlyList<string> Calls
+    {
+        get
+        {
+            lock (_callsLock)
+            {
+                return _calls.ToArray();
+            }
+        }
+    }
 
     /// <summary>The rate-limit budget returned from <see cref="CurrentBudget"/>.</summary>
     public RateLimitStatus? CurrentBudget { get; set; }
@@ -110,9 +127,22 @@ internal sealed class FakeDtddClient : IDtddClient
         return new DtddResult<IReadOnlyList<TopicSuperCategory>>(TopicSuperCategoriesResult, ResultSource.Live, Now);
     }
 
+    /// <summary>Clears <see cref="Calls"/>, e.g. to isolate assertions to calls made after some setup phase.</summary>
+    public void ClearCalls()
+    {
+        lock (_callsLock)
+        {
+            _calls.Clear();
+        }
+    }
+
     private async Task RecordAndMaybeThrowAsync(string call)
     {
-        Calls.Add(call);
+        lock (_callsLock)
+        {
+            _calls.Add(call);
+        }
+
         if (BeforeRespond is { } hook)
         {
             var exception = await hook(call).ConfigureAwait(false);

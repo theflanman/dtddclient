@@ -71,12 +71,23 @@ public class CachedDtddClientTests
         time.Advance(TimeSpan.FromMinutes(11));
         inner.Now = time.GetUtcNow();
 
+        // Gate the inner call so the background refresh cannot complete (and mutate inner.Calls from a pool
+        // thread) until this test says so — otherwise the assertion right after the stale read races the
+        // fire-and-forget refresh.
+        var gate = new TaskCompletionSource();
+        inner.BeforeRespond = async _ =>
+        {
+            await gate.Task;
+            return null;
+        };
+
         var stale = await client.GetItemAsync(10752);
 
         Assert.Equal(ResultSource.StaleCache, stale.Source);
         Assert.Equal(["GetItem:10752"], inner.Calls);
         Assert.NotNull(client.LastRefresh);
 
+        gate.SetResult();
         await client.LastRefresh!;
 
         Assert.Equal(["GetItem:10752", "GetItem:10752"], inner.Calls);
@@ -123,6 +134,26 @@ public class CachedDtddClientTests
     }
 
     [Fact]
+    public async Task RefreshFailure_ThrowingSubscriber_DoesNotFaultLastRefresh()
+    {
+        var (inner, _, time, client) = CreateSut();
+
+        await client.GetItemAsync(10752);
+        time.Advance(TimeSpan.FromMinutes(11));
+
+        inner.BeforeRespond = _ => Task.FromResult<Exception?>(new InvalidOperationException("boom"));
+        client.RefreshFailed += _ => throw new InvalidOperationException("subscriber blew up");
+
+        await client.GetItemAsync(10752);
+        Assert.NotNull(client.LastRefresh);
+
+        // Must not throw: a throwing RefreshFailed subscriber must not escape and fault the refresh task.
+        await client.LastRefresh!;
+
+        Assert.Equal(TaskStatus.RanToCompletion, client.LastRefresh!.Status);
+    }
+
+    [Fact]
     public async Task StaleHit_CoalescesConcurrentRefreshes()
     {
         var (inner, _, time, client) = CreateSut();
@@ -161,9 +192,14 @@ public class CachedDtddClientTests
         var (inner, _, _, client) = CreateSut();
         var search = ItemSearch.ByQuery("old yeller");
 
-        await client.SearchItemsAsync(search);
-        await client.SearchItemsAsync(search);
+        // A free-text query has no exact key to cache by; nothing about it should ever be written to the cache.
+        Assert.Null(LookupKey.FromSearch(search));
 
+        var first = await client.SearchItemsAsync(search);
+        var second = await client.SearchItemsAsync(search);
+
+        Assert.Equal(ResultSource.Live, first.Source);
+        Assert.Equal(ResultSource.Live, second.Source);
         Assert.Equal(2, inner.Calls.Count);
     }
 
@@ -194,7 +230,7 @@ public class CachedDtddClientTests
 
         await client.SearchItemsAsync(search);
         await client.GetItemAsync(10752);
-        inner.Calls.Clear();
+        inner.ClearCalls();
 
         var result = await client.SearchItemsAsync(search);
 
@@ -205,7 +241,7 @@ public class CachedDtddClientTests
     }
 
     [Fact]
-    public async Task Search_Imdb_Miss_StoresLookupAndItem()
+    public async Task Search_Imdb_Miss_StoresLookup()
     {
         var (inner, cache, _, client) = CreateSut();
         var search = ItemSearch.ByImdbId("tt123");
@@ -256,8 +292,9 @@ public class CachedDtddClientTests
     public void CurrentBudget_Delegates()
     {
         var (inner, _, _, client) = CreateSut();
-        inner.CurrentBudget = new RateLimitStatus(30, 25, 5000, 4900, StartTime);
+        var budget = new RateLimitStatus(30, 25, 5000, 4900, StartTime);
+        inner.CurrentBudget = budget;
 
-        Assert.Equal(inner.CurrentBudget, client.CurrentBudget);
+        Assert.Equal(budget, client.CurrentBudget);
     }
 }
