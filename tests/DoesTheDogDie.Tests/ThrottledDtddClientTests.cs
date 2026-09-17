@@ -417,4 +417,60 @@ public class ThrottledDtddClientTests
         var second = await client.GetItemTypesAsync();
         Assert.Equal(ResultSource.Live, second.Source);
     }
+
+    [Fact]
+    public async Task InnerTimeout_SurfacesAsOperationCanceled()
+    {
+        // Fix round 2, item 1: the bare "catch (OperationCanceledException)" used to map EVERY OCE to
+        // ObjectDisposedException, including one that has nothing to do with shutdown — e.g. an
+        // OperationCanceledException/TaskCanceledException thrown by the inner client itself (an HttpClient
+        // timeout is the canonical example) on an otherwise-live ThrottledDtddClient. That must surface to
+        // the caller unchanged, not be reported as "the client was disposed".
+        var (fake, _, client) = CreateSut();
+        await using var _ = client;
+
+        fake.BeforeRespond = (_, _) => Task.FromResult<Exception?>(new TaskCanceledException());
+
+        var exception = await Record.ExceptionAsync(() => client.GetTopicsAsync());
+
+        Assert.IsAssignableFrom<OperationCanceledException>(exception);
+        Assert.IsNotType<ObjectDisposedException>(exception);
+
+        // The client must still be usable afterward — this was never a shutdown.
+        fake.BeforeRespond = null;
+        var result = await client.GetItemTypesAsync();
+        Assert.Equal(ResultSource.Live, result.Source);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_Twice_IsIdempotent()
+    {
+        var (_, _, client) = CreateSut();
+
+        await client.DisposeAsync();
+        var exception = await Record.ExceptionAsync(() => client.DisposeAsync().AsTask());
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task AfterDispose_CallsThrowObjectDisposed()
+    {
+        var (_, _, client) = CreateSut();
+        await client.DisposeAsync();
+
+        // GetTopicsAsync throws synchronously (before returning a Task), so this is a plain try/catch rather
+        // than Assert.Throws(Async) — see the comment on the same pattern in QueueFull_Throws.
+        ObjectDisposedException? thrown = null;
+        try
+        {
+            _ = client.GetTopicsAsync();
+        }
+        catch (ObjectDisposedException ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.NotNull(thrown);
+    }
 }

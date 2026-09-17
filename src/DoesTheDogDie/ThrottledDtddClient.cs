@@ -170,28 +170,33 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
     private async Task ProcessJobAsync(Job job)
     {
-        if (job.Token.IsCancellationRequested)
-        {
-            job.Completion.TrySetCanceled(job.Token);
-            return;
-        }
-
-        if (TryGetMonthlyExhaustedException(out var exhaustedException))
-        {
-            job.Completion.TrySetException(exhaustedException);
-            return;
-        }
-
-        if (TryGetReserveExhaustedException(out var reserveException))
-        {
-            job.Completion.TrySetException(reserveException);
-            return;
-        }
-
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
-
+        // The try wraps the ENTIRE method body, not just the send/retry loop: the already-cancelled check,
+        // the exhaustion/reserve checks (which invoke the user-supplied ThrottleOptions.MonthResetRule), and
+        // CreateLinkedTokenSource are all capable of throwing, and previously sat outside any protection —
+        // an exception from any of them would have left the job's TaskCompletionSource unset and faulted
+        // the consumer loop. Nothing in this method may execute outside this try.
         try
         {
+            if (job.Token.IsCancellationRequested)
+            {
+                job.Completion.TrySetCanceled(job.Token);
+                return;
+            }
+
+            if (TryGetMonthlyExhaustedException(out var exhaustedException))
+            {
+                job.Completion.TrySetException(exhaustedException);
+                return;
+            }
+
+            if (TryGetReserveExhaustedException(out var reserveException))
+            {
+                job.Completion.TrySetException(reserveException);
+                return;
+            }
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
+
             // Two attempts total: the original send, plus one retry after a minute-limit Retry-After wait.
             // The retry delay below deliberately lives OUTSIDE the inner try/catch (and thus is covered by
             // the single outer try/catch/finally below): a prior version awaited it inside the
@@ -235,10 +240,13 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         {
             job.Completion.TrySetCanceled(job.Token);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
         {
-            // Caused by _shutdownCts (disposal), not the caller's own token: report it the same way as a
-            // job that was still sitting in the queue when disposal drained it (see M3 / RunLoopAsync above).
+            // Caused by _shutdownCts (disposal), not the caller's own token, and not an OperationCanceledException
+            // coming from the inner client itself (e.g. an HttpClient timeout while the client is still live —
+            // that one falls through to the catch below and surfaces to the caller unchanged): report it the
+            // same way as a job that was still sitting in the queue when disposal drained it (see M3 /
+            // RunLoopAsync above).
             job.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
         }
         catch (Exception ex)
@@ -444,11 +452,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 // Expected: the loop's channel read observes _shutdownCts and unwinds via this exception.
                 // Anything else escaping the loop is a genuine bug and should surface, not be swallowed.
             }
-
-            _shutdownCts.Dispose();
         }
         finally
         {
+            // In the finally, not the try body: a faulted _loopTask await (a genuine bug, per above) must
+            // not leak _shutdownCts or leave _disposeCompletion unset.
+            _shutdownCts.Dispose();
             _disposeCompletion.TrySetResult();
         }
     }
