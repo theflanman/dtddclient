@@ -1,13 +1,21 @@
 # NuGet publishing plan
 
-Status: not yet implemented. This is the plan for when we're ready to ship a
-package, most likely alongside or after Phase 6 (release packaging) in the
-roadmap.
+Status: package metadata, `IsAotCompatible`/SourceLink config, and the
+tag-triggered `publish.yml` workflow are in place (see "Order of
+operations" below for what's done vs. outstanding). Still need the
+package ID reserved on nuget.org and the `NUGET_API_KEY` secret before a
+tag can actually publish.
 
 ## Package shape
 
-- **Package ID:** `DoesTheDogDie` (matches the assembly/namespace). Worth a
-  quick nuget.org search before locking this in.
+- **Package ID:** `DtDDNetClient`. Deliberately not `DoesTheDogDie` —
+  we don't own that name, and a survey of other unofficial media-API
+  clients on NuGet (`TvDbSharper`/`TVDBSharp`/`TvdbClient` for TheTVDB,
+  `TMDbLib` for TMDb, `Anilist4Net`/`AniListNet` for AniList,
+  `OmdbApiNet` for IMDb-via-OMDb) shows the norm is to abbreviate the
+  service name rather than spell out the trademarked brand, often with a
+  `Client`/`Sharp`/`Net` suffix. `DtDDNetClient` follows that pattern
+  using the abbreviation this repo already uses throughout (`DtDD`).
 - **What ships:** only `src/DoesTheDogDie` (the `Api`, root, `Cache`, and
   `Statistics` namespaces already live in one assembly, so it's a single
   package). `Microsoft.Data.Sqlite` stays a normal `PackageReference` — it's
@@ -24,41 +32,18 @@ roadmap.
   `CHANGELOG.md` entry — decide which once we're closer to cutting a
   release; not urgent now.
 
-## Required `.csproj` metadata
+## `.csproj` metadata — done
 
-Add to `src/DoesTheDogDie/DoesTheDogDie.csproj` (or hoist the
-package-agnostic bits into `Directory.Build.props` so they don't drift):
-
-```xml
-<PropertyGroup>
-  <PackageId>DoesTheDogDie</PackageId>
-  <Description>Community-led .NET client for the Does the Dog Die API (doesthedogdie.com), built around its free-tier rate limits.</Description>
-  <Authors>Connor Flanigan</Authors>
-  <PackageLicenseExpression>MIT</PackageLicenseExpression>
-  <PackageProjectUrl>https://github.com/theflanman/dtddclient</PackageProjectUrl>
-  <RepositoryUrl>https://github.com/theflanman/dtddclient</RepositoryUrl>
-  <PackageReadmeFile>README.md</PackageReadmeFile>
-  <PackageTags>doesthedogdie;dtdd;content-warnings;trigger-warnings</PackageTags>
-  <PublishRepositoryUrl>true</PublishRepositoryUrl>
-  <EmbedUntrackedSources>true</EmbedUntrackedSources>
-  <IncludeSymbols>true</IncludeSymbols>
-  <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-  <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
-</PropertyGroup>
-
-<ItemGroup>
-  <None Include="../../README.md" Pack="true" PackagePath="\" />
-</ItemGroup>
-```
-
-Also add SourceLink so consumers can step into the published source:
-
-```xml
-<PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.*" PrivateAssets="All" />
-```
-
-`PackageLicenseExpression` needs `LICENSE` to actually be MIT (it already
-is) and matches the SPDX identifier exactly.
+Added to `src/DoesTheDogDie/DoesTheDogDie.csproj`: `PackageId`
+(`DtDDNetClient`), description, `PackageLicenseExpression` (`MIT`),
+project/repo URLs, `PackageReadmeFile` + embedded `README.md`/`LICENSE`,
+`IsAotCompatible` (builds with 0 warnings today), symbol packages
+(`.snupkg`), and `Microsoft.SourceLink.GitHub` (pinned to `10.0.401` to
+match the installed SDK — the `8.*` wildcard originally drafted here
+pulled in a `Microsoft.Data.Sqlite`-transitive package with a known
+vulnerability that failed under `TreatWarningsAsErrors`/NuGet audit).
+Verified locally: `dotnet pack` produces `DtDDNetClient.<version>.nupkg`
+with both TFM assemblies, README, and LICENSE embedded.
 
 ## Versioning mechanics
 
@@ -76,69 +61,38 @@ Recommendation: start with (1) — tag-driven, manual — since release
 cadence will be low early on. Revisit (2) if preview/nightly packages
 become useful for the Jellyfin plugin to consume ahead of a tagged release.
 
-## CI: publish workflow
+## CI: publish workflow — done
 
-New workflow, separate from `.github/workflows/build.yml`, triggered only
-on version tags so a stray push can't publish:
+`.github/workflows/publish.yml` exists, triggered only on `v*.*.*` tags.
+It restores, re-runs the full test suite, packs `src/DoesTheDogDie` with
+`-p:Version` from the tag, pushes to nuget.org, and attaches the
+`.nupkg`/`.snupkg` to a GitHub release via `softprops/action-gh-release`.
 
-```yaml
-name: publish
-on:
-  push:
-    tags: ["v*.*.*"]
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    environment: nuget-publish   # manual approval gate, see below
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: |
-            9.0.x
-            10.0.x
-      - run: dotnet restore
-      - run: dotnet test --configuration Release
-      - run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          dotnet pack src/DoesTheDogDie -c Release -p:Version=$VERSION -o ./artifacts
-      - run: dotnet nuget push ./artifacts/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: ./artifacts/*.nupkg
-```
-
-Things this depends on, to set up before first use:
-
-- **`NUGET_API_KEY` secret**: generate a nuget.org API key scoped to just
-  this package ID (nuget.org lets you scope a key to specific packages once
-  the package ID has been reserved by an initial manual push, or you can
-  scope it to a glob before that — check current nuget.org UI).
-- **`nuget-publish` GitHub Environment**: configure it with a required
-  reviewer, so pushing a `v*` tag stages a publish but a human has to
-  approve the job before it actually runs. Cheap insurance against a
-  mistaken or malicious tag push.
-- **Re-running `dotnet test` in the publish job**: redundant with the
-  `build` workflow that already ran on the commit, but cheap, and it's the
-  last checkpoint before something goes out the door.
+It runs under the `nuget-publish` GitHub Environment, which is also
+already created (via the API, not the web UI) with `theflanman` as a
+required reviewer — so pushing a `v*` tag stages the run but it won't
+execute until manually approved. `can_admins_bypass` is `true` by
+GitHub's default for environments, which is fine for a single-maintainer
+repo.
 
 ## Order of operations for the first release
 
-1. Add the `.csproj` metadata above.
-2. Reserve the package ID with a manual `dotnet nuget push` from a local
-   machine (first push to a new ID can't come from an environment-gated CI
-   job with a pre-scoped key, since the key can't be scoped to a package
-   that doesn't exist yet).
-3. Add the `NUGET_API_KEY` secret and `nuget-publish` environment.
-4. Add the `publish.yml` workflow.
-5. Tag `v0.1.0`, push the tag, approve the environment gate, confirm the
-   package shows up on nuget.org.
+1. ✅ `.csproj` metadata (above).
+2. ✅ `publish.yml` workflow.
+3. ✅ `nuget-publish` GitHub Environment with required-reviewer gate.
+4. ⬜ **Reserve the package ID** with a manual `dotnet nuget push` from a
+   local machine, using a personal nuget.org API key — this has to be a
+   human/local action; a scoped CI key can't push a package ID that
+   doesn't exist yet, and this repo's automation shouldn't hold an
+   unscoped nuget.org key.
+5. ⬜ **Add the `NUGET_API_KEY` secret**, scoped to just `DtDDNetClient`
+   once reserved:
+   `gh secret set NUGET_API_KEY --repo theflanman/dtddclient --env nuget-publish`
+6. ⬜ Tag `v0.1.0`, push the tag, approve the environment gate, confirm
+   the package shows up on nuget.org.
 
 ## Open questions to settle before v0.1.0
 
-- Is `DoesTheDogDie` the package ID we want, or does it read oddly divorced
-  from the site's branding in a NuGet listing? Worth a second opinion.
 - Do we want a single package, or split `Cache`/`Statistics` into optional
   packages later so a consumer who only wants the thin API client doesn't
   pull in `Microsoft.Data.Sqlite`? Not worth the complexity at 0.x; revisit

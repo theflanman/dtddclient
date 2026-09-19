@@ -6,7 +6,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <PackageId>DoesTheDogDie</PackageId>
+    <PackageId>DtDDNetClient</PackageId>
     <Description>Community-led .NET client for the Does the Dog Die API (doesthedogdie.com), built around its free-tier rate limits.</Description>
     <Authors>Connor Flanigan</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
