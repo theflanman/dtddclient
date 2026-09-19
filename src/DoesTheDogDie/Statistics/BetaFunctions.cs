@@ -38,7 +38,7 @@ internal static class BetaFunctions
         {
             output += Math.Log(i);
         }
-        
+
         return output;
     }
 

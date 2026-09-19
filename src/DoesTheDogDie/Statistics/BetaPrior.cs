@@ -28,5 +28,5 @@ public readonly record struct BetaPrior
 
     /// <summary>The uninformative Beta(1, 1) uniform prior.</summary>
     public static BetaPrior Uniform => new(1, 1);
-    
+
 }

@@ -47,10 +47,10 @@ public readonly record struct BetaPosterior
 
         var effectivePrior = prior ?? BetaPrior.Uniform;
 
-        return new BetaPosterior(effectivePrior.Alpha + (UInt64) yes, effectivePrior.Beta + (UInt64) no);
+        return new BetaPosterior(effectivePrior.Alpha + (UInt64)yes, effectivePrior.Beta + (UInt64)no);
     }
 
-    public double Mean => ((double) Alpha)/((double) (Alpha + Beta)) ;
+    public double Mean => ((double)Alpha) / ((double)(Alpha + Beta));
 
     public double Variance
     {
