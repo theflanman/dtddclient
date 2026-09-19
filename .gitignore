@@ -2,6 +2,7 @@
 CLAUDE.md
 .superpowers/
 docs/superpowers
+docs/nuget-publishing-plan.md
 bin/
 obj/
 
