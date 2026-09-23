@@ -6,6 +6,19 @@ docs/nuget-publishing-plan.md
 bin/
 obj/
 
+# `dotnet pack -o ./artifacts`, as the build workflow runs it
+artifacts/
+
+# JetBrains database tool artifact, dropped in the repo root
+identifier.sqlite
+
+# JetBrains IDE settings are personal, and the template below only names some
+# of .idea/. Nothing under it is tracked, so ignore the directory wholesale.
+.idea/
+
+# Rider/ReSharper per-user solution settings
+*.DotSettings.user
+
 ### JetBrains template
 # Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion, Android Studio, WebStorm and Rider
 # Reference: https://intellij-support.jetbrains.com/hc/en-us/articles/206544839

@@ -47,4 +47,9 @@ jobs:
       - name: Attach packages to GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ./artifacts/*.nupkg
+          # Both globs are needed: *.nupkg does not match *.snupkg, so without
+          # the second line the symbols package is pushed to nuget.org but never
+          # attached to the GitHub release.
+          files: |
+            ./artifacts/*.nupkg
+            ./artifacts/*.snupkg
