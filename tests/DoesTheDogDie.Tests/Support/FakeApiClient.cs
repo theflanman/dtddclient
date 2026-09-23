@@ -10,8 +10,26 @@ namespace DoesTheDogDie.Tests.Support;
 /// </summary>
 internal sealed class FakeApiClient : IDtddApiClient
 {
-    /// <summary>Short descriptions of each call made, in order (e.g. "GetItem:10752", "Search:?q=old%20yeller").</summary>
-    public List<string> Calls { get; } = [];
+    private readonly Lock _callsLock = new();
+    private readonly List<string> _calls = [];
+
+    /// <summary>
+    /// Short descriptions of each call made, in order (e.g. "GetItem:10752", "Search:?q=old%20yeller").
+    /// <c>ThrottledDtddClient</c> issues its calls from a consumer task, so these are written from a pool
+    /// thread while a test thread reads them - directly, or in an <see cref="AsyncAssert"/> spin loop. An
+    /// unsynchronized <see cref="List{T}"/> read concurrently with a write can observe a stale count or tear
+    /// outright, so each read takes a lock-protected snapshot rather than exposing the backing list.
+    /// </summary>
+    public IReadOnlyList<string> Calls
+    {
+        get
+        {
+            lock (_callsLock)
+            {
+                return _calls.ToArray();
+            }
+        }
+    }
 
     /// <summary>The rate-limit snapshot attached to every successful response.</summary>
     public RateLimitStatus NextRateLimit { get; set; } = new(30, 30, 5000, 5000, DateTimeOffset.UnixEpoch);
@@ -78,7 +96,12 @@ internal sealed class FakeApiClient : IDtddApiClient
     private async Task RecordAndMaybeThrowAsync(string call, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        Calls.Add(call);
+
+        lock (_callsLock)
+        {
+            _calls.Add(call);
+        }
+
         if (BeforeRespond is { } hook)
         {
             var exception = await hook(call, ct).ConfigureAwait(false);
