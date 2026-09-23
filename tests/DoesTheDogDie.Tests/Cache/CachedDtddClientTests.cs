@@ -71,9 +71,10 @@ public class CachedDtddClientTests
         time.Advance(TimeSpan.FromMinutes(11));
         inner.Now = time.GetUtcNow();
 
-        // Gate the inner call so the background refresh cannot complete (and mutate inner.Calls from a pool
-        // thread) until this test says so — otherwise the assertion right after the stale read races the
-        // fire-and-forget refresh.
+        // Gate the inner call so the background refresh cannot complete until this test says so. Note the
+        // gate holds the *response*, not the call: the fake records into Calls before awaiting BeforeRespond,
+        // so a refresh can appear in Calls the moment it is scheduled. Assertions here must therefore not
+        // depend on whether the refresh has entered the fake yet.
         var gate = new TaskCompletionSource();
         inner.BeforeRespond = async _ =>
         {
@@ -84,8 +85,12 @@ public class CachedDtddClientTests
         var stale = await client.GetItemAsync(10752);
 
         Assert.Equal(ResultSource.StaleCache, stale.Source);
-        Assert.Equal(["GetItem:10752"], inner.Calls);
+
+        // The stale value came back without waiting on the refresh. "LastRefresh has not completed" is the
+        // sequenced way to say that - the gate is still closed, so it cannot complete. Asserting a call count
+        // instead would be asserting the refresh has not yet *entered* the fake, which nothing orders.
         Assert.NotNull(client.LastRefresh);
+        Assert.False(client.LastRefresh!.IsCompleted);
 
         gate.SetResult();
         await client.LastRefresh!;
@@ -438,8 +443,8 @@ public class CachedDtddClientTests
 
         Assert.Equal(ResultSource.StaleCache, stale.Source);
         Assert.Empty(stale.Value);
-        Assert.Single(inner.Calls);
         Assert.NotNull(client.LastRefresh);
+        Assert.False(client.LastRefresh!.IsCompleted);
 
         gate.SetResult();
         await client.LastRefresh!;
