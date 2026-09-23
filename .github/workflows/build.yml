@@ -2,13 +2,34 @@ name: build
 
 on:
   push:
-    branches: [main, phases-*]
+    branches: ["**"]
   pull_request:
-    branches: [main, phases-*]
+    branches: ["**"]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - ubuntu-24.04-arm
+          - windows-11-arm
+
+    defaults:
+      run:
+        # GitHub ships bash on the Windows runners too. Pinning it keeps every
+        # step identical across legs instead of silently switching to PowerShell.
+        shell: bash
+
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,14 +47,30 @@ jobs:
         run: dotnet restore
 
       - name: Format check
+        # Line-ending sensitive, and identical on every leg. One run is enough.
+        if: matrix.os == 'ubuntu-latest'
         run: dotnet format --verify-no-changes
 
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
       - name: Test
+        # DTDD_API_KEY is intentionally not set: IntegrationFact tests self-skip
+        # without it, so CI never spends the free-tier monthly request budget.
         run: dotnet test --no-build --configuration Release
-        env:
-          # DTDD_API_KEY is intentionally not set: IntegrationFact tests self-skip
-          # without it, so CI never spends the free-tier monthly request budget.
-          DOTNET_NOLOGO: "1"
+
+      - name: Pack
+        # The package is RID-agnostic, so one leg proves packaging. Running it
+        # per-PR catches a broken pack here rather than at release time.
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet pack src/DoesTheDogDie --configuration Release -o ./artifacts
+
+      - name: Upload packages
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            ./artifacts/*.nupkg
+            ./artifacts/*.snupkg
+          if-no-files-found: error

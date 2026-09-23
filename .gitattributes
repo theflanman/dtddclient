@@ -1,0 +1,20 @@
+# Normalize all text files to LF in the repository, regardless of the platform
+# they were authored on. Without this, a Windows clone with Git's default
+# core.autocrlf=true produces a CRLF working tree, and `dotnet format
+# --verify-no-changes` in CI has no stable line ending to anchor to.
+* text=auto eol=lf
+
+# Explicitly binary, so Git never attempts line-ending conversion on them.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.nupkg binary
+*.snupkg binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.sqlite binary
+*.db binary

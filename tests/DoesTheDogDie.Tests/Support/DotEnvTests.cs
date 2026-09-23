@@ -37,6 +37,17 @@ public class DotEnvTests
     }
 
     [Fact]
+    public void Parse_HandlesCrlfLineEndings()
+    {
+        // A .env written on Windows, or checked out with core.autocrlf=true, arrives CRLF.
+        var result = DotEnv.Parse("# a comment\r\n\r\nFOO=bar\r\nBAZ=\"qux\"\r\n");
+
+        Assert.Equal(2, result.Count);
+        Assert.Equal("bar", result["FOO"]);
+        Assert.Equal("qux", result["BAZ"]);
+    }
+
+    [Fact]
     public void Parse_LastWins()
     {
         var result = DotEnv.Parse("FOO=first\nFOO=second\n");

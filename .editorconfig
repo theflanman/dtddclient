@@ -1,0 +1,10 @@
+# Deliberately minimal: this exists to make `dotnet format` deterministic across
+# the Linux and Windows CI runners, not to impose a house style. Everything else
+# is left to the SDK defaults.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
