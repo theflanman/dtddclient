@@ -2,7 +2,10 @@ name: build
 
 on:
   push:
-    branches: ["**"]
+    # Trunk only. A branch push that also has a PR open would otherwise run the
+    # whole matrix twice, once per event. Tags are left to publish.yml, which
+    # runs its own restore/build/test before packing.
+    branches: [main]
   pull_request:
     branches: ["**"]
   workflow_dispatch:
