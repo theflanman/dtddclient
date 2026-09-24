@@ -44,6 +44,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private RateLimitStatus? _currentBudget;
     private DateTimeOffset? _exhaustedUntil;
     private DateTimeOffset? _backgroundHeldUntil;
+    private DateTimeOffset? _budgetMonthEndsAt;
     private TaskCompletionSource _wake = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _addingCompleted;
     private int _disposedFlag;
@@ -575,6 +576,11 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         return _options.DefaultMinuteLimit > 0 ? _options.DefaultMinuteLimit : 1;
     }
 
+    /// <summary>
+    /// Records the latest rate-limit figures, and when the month they describe ends. A MonthRemaining figure is
+    /// only true for the month it was observed in: without that end instant, a figure at or under a floor from
+    /// the last response of one month would trip that floor in the next and hold its work until the month after.
+    /// </summary>
     private void UpdateBudget(RateLimitStatus? rateLimit)
     {
         if (rateLimit is null)
@@ -582,9 +588,23 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             return;
         }
 
+        // The throttle's own clock, not rateLimit.ObservedAt: one clock stays authoritative for every deadline.
+        // If the user-supplied rule throws, the figure simply never expires - the behavior before this existed -
+        // rather than failing every response; the rule still fails loudly where a floor or 429 needs it.
+        DateTimeOffset? monthEndsAt;
+        try
+        {
+            monthEndsAt = _options.MonthResetRule(_timeProvider.GetUtcNow());
+        }
+        catch (Exception)
+        {
+            monthEndsAt = null;
+        }
+
         lock (_stateLock)
         {
             _currentBudget = rateLimit;
+            _budgetMonthEndsAt = monthEndsAt;
         }
     }
 
@@ -677,7 +697,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// If an exhaustion or background-hold clock has passed, clears it along with the stale
+    /// If an exhaustion or background-hold clock - or the end of the month the budget was observed in - has
+    /// passed, clears it along with the stale
     /// <see cref="RateLimitStatus.MonthRemaining"/> figure that armed it (keeping
     /// <see cref="RateLimitStatus.MonthLimit"/> and the other fields), so exactly one probe request is allowed out
     /// to re-seed the budget from real headers. Without clearing it on a background hold too, last month's figure
@@ -696,6 +717,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         if (_backgroundHeldUntil is { } held && now >= held)
         {
             _backgroundHeldUntil = null;
+            monthRolledOver = true;
+        }
+
+        if (_budgetMonthEndsAt is { } monthEnds && now >= monthEnds)
+        {
+            _budgetMonthEndsAt = null;
             monthRolledOver = true;
         }
 
