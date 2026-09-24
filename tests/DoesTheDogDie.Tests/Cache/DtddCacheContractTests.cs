@@ -80,7 +80,7 @@ public abstract class DtddCacheContractTests
     //  - Each list is deliberately OUT of key order. A query that reads child rows by primary key instead of
     //    by insertion ordinal returns them sorted by id, and only an unsorted fixture can tell the difference.
 
-    private static ItemDetail MakeFullItem() => new()
+    protected static ItemDetail MakeFullItem() => new()
     {
         Id = 10752,
         Name = "Old Yeller",
@@ -101,7 +101,7 @@ public abstract class DtddCacheContractTests
         ],
     };
 
-    private static ItemDetail MakeSparseItem() => new()
+    protected static ItemDetail MakeSparseItem() => new()
     {
         Id = 20001,
         Name = "Untitled",
@@ -109,7 +109,7 @@ public abstract class DtddCacheContractTests
         ItemTypeName = "Book",
     };
 
-    private static Rating MakeFullRating(int id) => new()
+    protected static Rating MakeFullRating(int id) => new()
     {
         Id = id,
         Yes = 7,
@@ -131,7 +131,7 @@ public abstract class DtddCacheContractTests
         IsSceneAlert = true,
     };
 
-    private static Rating MakeSparseRating(int id) => new()
+    protected static Rating MakeSparseRating(int id) => new()
     {
         Id = id,
         Yes = 0,
@@ -145,7 +145,7 @@ public abstract class DtddCacheContractTests
         IsSceneAlert = false,
     };
 
-    private static readonly Topic[] AllTopics =
+    protected static readonly Topic[] AllTopics =
     [
         new Topic
         {
@@ -163,7 +163,7 @@ public abstract class DtddCacheContractTests
         new Topic { Id = 12, Name = "a cat dies", TopicCategoryId = 4 },
     ];
 
-    private static readonly ItemType[] AllItemTypes =
+    protected static readonly ItemType[] AllItemTypes =
     [
         new ItemType
         {
@@ -181,13 +181,13 @@ public abstract class DtddCacheContractTests
         new ItemType { Id = 14, Name = "Book", Slug = "books", Verb = "read", PastTenseVerb = "read" },
     ];
 
-    private static readonly TopicCategory[] AllTopicCategories =
+    protected static readonly TopicCategory[] AllTopicCategories =
     [
         new TopicCategory { Id = 9, Name = "Animals", TopicSuperCategoryId = 2 },
         new TopicCategory { Id = 4, Name = "Death", TopicSuperCategoryId = 1 },
     ];
 
-    private static readonly TopicSuperCategory[] AllTopicSuperCategories =
+    protected static readonly TopicSuperCategory[] AllTopicSuperCategories =
     [
         new TopicSuperCategory { Id = 2, Name = "Content Warnings", ShortName = "Content" },
         new TopicSuperCategory { Id = 1, Name = "Sensory", ShortName = "Sense" },
