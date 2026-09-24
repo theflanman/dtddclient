@@ -6,11 +6,24 @@ namespace DoesTheDogDie;
 public sealed class ThrottleOptions
 {
     /// <summary>
-    /// Number of monthly requests to hold back as a safety margin (never spent by the queue). Defaults to 0.
+    /// The interactive floor: once the month's remaining requests fall to this many, interactive requests are
+    /// refused until the month resets. Defaults to 50, which no current priority class ever spends - it is
+    /// held back for a future class above <see cref="RequestPriority.Interactive"/>.
     /// </summary>
-    public int MonthlyReserve { get; init; } = 0;
+    public int MonthlyReserve { get; init; } = 50;
 
-    /// <summary>Maximum number of requests that may be queued before <see cref="DtddQueueFullException"/> is thrown.</summary>
+    /// <summary>
+    /// The background floor: once the month's remaining requests fall to this many, background requests are
+    /// held until the month resets, leaving the rest for interactive work. Defaults to 500. Must be at least
+    /// <see cref="MonthlyReserve"/>, or background work could spend the interactive reserve.
+    /// </summary>
+    public int BackgroundReserve { get; init; } = 500;
+
+    /// <summary>
+    /// Maximum number of requests that may be queued per priority class before
+    /// <see cref="DtddQueueFullException"/> is thrown. Per class, so a backlog of held background work can never
+    /// lock out interactive requests.
+    /// </summary>
     public int MaxQueueLength { get; init; } = 1000;
 
     /// <summary>
