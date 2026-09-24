@@ -23,7 +23,8 @@ public class ThrottleOptionsTests
     {
         var options = new ThrottleOptions();
 
-        Assert.Equal(0, options.MonthlyReserve);
+        Assert.Equal(50, options.MonthlyReserve);
+        Assert.Equal(500, options.BackgroundReserve);
         Assert.Equal(1000, options.MaxQueueLength);
         Assert.Equal(30, options.DefaultMinuteLimit);
     }

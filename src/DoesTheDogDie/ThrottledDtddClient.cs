@@ -1,5 +1,4 @@
 using System.Net;
-using System.Threading.Channels;
 using DoesTheDogDie.Api;
 
 namespace DoesTheDogDie;
@@ -9,21 +8,44 @@ namespace DoesTheDogDie;
 /// against the DtDD per-minute and monthly rate limits. This is the "work queue" layer: it does not cache
 /// anything itself, but is safe to call concurrently from many threads.
 /// </summary>
+/// <remarks>
+/// Calls made on this instance are <see cref="RequestPriority.Interactive"/>; <see cref="ForPriority"/> returns a
+/// view that enqueues at another class. Interactive work is always served before queued background work. Each
+/// class stops at its own monthly floor: interactive fails fast once it is reached, while background work is
+/// held - still queued, its caller still waiting - until the month resets.
+/// </remarks>
 public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 {
+    /// <summary>
+    /// The longest the consumer sleeps before re-checking whether held background work may run. A single
+    /// month-long timer, computed from a `now` read before the timer is created, overshoots whenever the clock
+    /// moves in between - a system clock change, a suspended machine (Task.Delay does not count suspended time
+    /// on every platform), or a test's fake clock. Re-checking the absolute deadline bounds that to one interval.
+    /// </summary>
+    private static readonly TimeSpan HeldRecheckInterval = TimeSpan.FromHours(1);
+
     private readonly IDtddApiClient _inner;
     private readonly ThrottleOptions _options;
     private readonly TimeProvider _timeProvider;
-    private readonly Channel<Job> _channel;
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly Task _loopTask;
     private readonly Lock _stateLock = new();
     private readonly TaskCompletionSource _disposeCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly PriorityView _backgroundView;
+
+    // Two queues, not one ordered channel: holding background work needs to peek at it, put a job back at the
+    // front after a 429, and drain interactive work alone - none of which a Channel supports. Guarded by
+    // _stateLock, like everything below.
+    private readonly LinkedList<Job> _interactiveQueue = new();
+    private readonly LinkedList<Job> _backgroundQueue = new();
 
     private readonly Queue<DateTimeOffset> _sendTimestamps = new();
 
     private RateLimitStatus? _currentBudget;
     private DateTimeOffset? _exhaustedUntil;
+    private DateTimeOffset? _backgroundHeldUntil;
+    private TaskCompletionSource _wake = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _addingCompleted;
     private int _disposedFlag;
 
     public ThrottledDtddClient(IDtddApiClient inner, ThrottleOptions? options = null, TimeProvider? timeProvider = null)
@@ -33,7 +55,17 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         _inner = inner;
         _options = options ?? new ThrottleOptions();
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _channel = Channel.CreateBounded<Job>(new BoundedChannelOptions(_options.MaxQueueLength) { SingleReader = true });
+
+        if (_options.BackgroundReserve < _options.MonthlyReserve)
+        {
+            throw new ArgumentException(
+                $"{nameof(ThrottleOptions.BackgroundReserve)} ({_options.BackgroundReserve}) must be at least " +
+                $"{nameof(ThrottleOptions.MonthlyReserve)} ({_options.MonthlyReserve}), or background work could " +
+                "spend the interactive reserve.",
+                nameof(options));
+        }
+
+        _backgroundView = new PriorityView(this, RequestPriority.Background);
         _loopTask = Task.Run(RunLoopAsync);
     }
 
@@ -51,50 +83,90 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
     private bool IsDisposed => Volatile.Read(ref _disposedFlag) != 0;
 
+    /// <summary>
+    /// Returns an <see cref="IDtddClient"/> that enqueues every call on this client at
+    /// <paramref name="priority"/>. <see cref="RequestPriority.Interactive"/> returns this instance itself. The
+    /// view shares this client's queue, budget and lifetime; dispose this client, not the view.
+    /// </summary>
+    public IDtddClient ForPriority(RequestPriority priority) => priority switch
+    {
+        RequestPriority.Interactive => this,
+        RequestPriority.Background => _backgroundView,
+        _ => throw new ArgumentOutOfRangeException(nameof(priority), priority, "Unknown request priority."),
+    };
+
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(search);
-        return EnqueueAsync(c => _inner.SearchItemsAsync(search, c), ct);
-    }
+        => SearchItemsCoreAsync(search, RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<ItemDetail>> GetItemAsync(int itemId, CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetItemAsync(itemId, c), ct);
+        => GetItemCoreAsync(itemId, RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsAsync(int itemId, int? topicId = null, CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetRatingsAsync(itemId, topicId, c), ct);
+        => GetRatingsCoreAsync(itemId, topicId, RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsAsync(CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetTopicsAsync(c), ct);
+        => GetTopicsCoreAsync(RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesAsync(CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetItemTypesAsync(c), ct);
+        => GetItemTypesCoreAsync(RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesAsync(CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetTopicCategoriesAsync(c), ct);
+        => GetTopicCategoriesCoreAsync(RequestPriority.Interactive, ct);
 
     /// <inheritdoc />
     public Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesAsync(CancellationToken ct = default)
-        => EnqueueAsync(c => _inner.GetTopicSuperCategoriesAsync(c), ct);
+        => GetTopicSuperCategoriesCoreAsync(RequestPriority.Interactive, ct);
+
+    private Task<DtddResult<IReadOnlyList<Item>>> SearchItemsCoreAsync(ItemSearch search, RequestPriority priority, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(search);
+        return EnqueueAsync(c => _inner.SearchItemsAsync(search, c), priority, ct);
+    }
+
+    private Task<DtddResult<ItemDetail>> GetItemCoreAsync(int itemId, RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetItemAsync(itemId, c), priority, ct);
+
+    private Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsCoreAsync(int itemId, int? topicId, RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetRatingsAsync(itemId, topicId, c), priority, ct);
+
+    private Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsCoreAsync(RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetTopicsAsync(c), priority, ct);
+
+    private Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesCoreAsync(RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetItemTypesAsync(c), priority, ct);
+
+    private Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesCoreAsync(RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetTopicCategoriesAsync(c), priority, ct);
+
+    private Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesCoreAsync(RequestPriority priority, CancellationToken ct)
+        => EnqueueAsync(c => _inner.GetTopicSuperCategoriesAsync(c), priority, ct);
 
     /// <summary>
     /// Enqueues an API call to be served by the background consumer, and awaits its result.
     /// </summary>
     private Task<DtddResult<T>> EnqueueAsync<T>(
-        Func<CancellationToken, Task<ApiResponse<T>>> call, CancellationToken ct)
+        Func<CancellationToken, Task<ApiResponse<T>>> call, RequestPriority priority, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(IsDisposed, this);
-        ThrowIfMonthlyExhausted();
+
+        // Only interactive work fails fast on an exhausted month. Background work is held instead: it is
+        // queued now and served once the month resets.
+        if (priority == RequestPriority.Interactive)
+        {
+            ThrowIfMonthlyExhausted();
+        }
 
         var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var job = new Job
         {
+            Priority = priority,
             Token = ct,
             Completion = tcs,
             Execute = async jobCt =>
@@ -110,14 +182,34 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             ? ct.Register(() => tcs.TrySetCanceled(ct))
             : default;
 
-        if (!_channel.Writer.TryWrite(job))
+        bool disposed;
+        bool full;
+        lock (_stateLock)
+        {
+            var queue = QueueFor(priority);
+            if (queue.Count >= _options.MaxQueueLength)
+            {
+                // Held background jobs can wait a month; one whose caller already cancelled should not keep
+                // holding a slot until then.
+                RemoveCompleted(queue);
+            }
+
+            disposed = _addingCompleted;
+            full = !disposed && queue.Count >= _options.MaxQueueLength;
+            if (!disposed && !full)
+            {
+                queue.AddLast(job);
+                _wake.TrySetResult();
+            }
+        }
+
+        if (disposed || full)
         {
             registration.Dispose();
 
-            // TryWrite fails either because the channel is full, or because the writer was completed by
-            // DisposeAsync racing with this call. Distinguish them so a caller doesn't see a misleading
-            // "queue full" for what is actually shutdown.
-            if (IsDisposed)
+            // Distinguish the two so a caller racing DisposeAsync doesn't see a misleading "queue full" for what
+            // is actually shutdown.
+            if (disposed)
             {
                 throw new ObjectDisposedException(nameof(ThrottledDtddClient));
             }
@@ -143,14 +235,34 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         }
     }
 
-    /// <summary>The single background consumer that dequeues and executes jobs in order.</summary>
+    /// <summary>
+    /// The single background consumer: runs the next eligible job, or waits for new work - or, while background
+    /// work is held, for the month to reset.
+    /// </summary>
     private async Task RunLoopAsync()
     {
         try
         {
-            await foreach (var job in _channel.Reader.ReadAllAsync(_shutdownCts.Token).ConfigureAwait(false))
+            while (true)
             {
-                await ProcessJobAsync(job).ConfigureAwait(false);
+                _shutdownCts.Token.ThrowIfCancellationRequested();
+
+                var step = TakeNextStep();
+                if (step.Job is { } job)
+                {
+                    if (step.Failure is { } failure)
+                    {
+                        job.Completion.TrySetException(failure);
+                    }
+                    else
+                    {
+                        await ProcessJobAsync(job).ConfigureAwait(false);
+                    }
+
+                    continue;
+                }
+
+                await WaitForWorkAsync(step.Wake!, step.HeldFor).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -158,14 +270,158 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             // Shutting down; fall through to drain below.
         }
 
-        while (_channel.Reader.TryRead(out var leftover))
+        List<Job> leftovers;
+        lock (_stateLock)
+        {
+            leftovers = [.. _interactiveQueue, .. _backgroundQueue];
+            _interactiveQueue.Clear();
+            _backgroundQueue.Clear();
+        }
+
+        foreach (var leftover in leftovers)
         {
             leftover.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
         }
     }
 
+    /// <summary>
+    /// Takes the next job to run - interactive first, then background unless background is held - or, when
+    /// nothing may run, returns what to wait on instead.
+    /// </summary>
+    private NextStep TakeNextStep()
+    {
+        lock (_stateLock)
+        {
+            if (_interactiveQueue.First is { } interactive)
+            {
+                _interactiveQueue.RemoveFirst();
+                return new NextStep(interactive.Value, null, null, null);
+            }
+
+            // A held job whose caller cancelled is already complete; don't let it hold the queue head for a month.
+            while (_backgroundQueue.First is { } done && done.Value.Completion.Task.IsCompleted)
+            {
+                _backgroundQueue.RemoveFirst();
+            }
+
+            if (_backgroundQueue.First is { } background)
+            {
+                var now = _timeProvider.GetUtcNow();
+                DateTimeOffset? heldUntil;
+                try
+                {
+                    heldUntil = BackgroundHeldUntilLocked(now);
+                }
+                catch (Exception ex)
+                {
+                    // The user-supplied MonthResetRule threw. Fail the job that needed it rather than let the
+                    // exception escape and kill the consumer loop, as ProcessJobAsync does for interactive work.
+                    _backgroundQueue.RemoveFirst();
+                    return new NextStep(background.Value, ex, null, null);
+                }
+
+                if (heldUntil is null)
+                {
+                    _backgroundQueue.RemoveFirst();
+                    return new NextStep(background.Value, null, null, null);
+                }
+
+                var remaining = ClampNonNegative(heldUntil.Value - now);
+                return new NextStep(null, null, CurrentWakeLocked(), remaining < HeldRecheckInterval ? remaining : HeldRecheckInterval);
+            }
+
+            return new NextStep(null, null, CurrentWakeLocked(), null);
+        }
+    }
+
+    /// <summary>
+    /// Waits until new work is enqueued or, if <paramref name="heldFor"/> is given, until held background work
+    /// may run again - whichever comes first. Throws <see cref="OperationCanceledException"/> on shutdown.
+    /// </summary>
+    private async Task WaitForWorkAsync(Task wake, TimeSpan? heldFor)
+    {
+        if (heldFor is not { } delay)
+        {
+            await wake.WaitAsync(_shutdownCts.Token).ConfigureAwait(false);
+            return;
+        }
+
+        using var timerCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token);
+        try
+        {
+            var timer = Task.Delay(delay, _timeProvider, timerCts.Token);
+            await Task.WhenAny(wake, timer).WaitAsync(_shutdownCts.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Woken early by new work: release the timer rather than leave it pending until the month resets.
+            await timerCts.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The task the next enqueue will complete. Must be called while holding <see cref="_stateLock"/>.</summary>
+    private Task CurrentWakeLocked()
+    {
+        if (_wake.Task.IsCompleted)
+        {
+            _wake = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        return _wake.Task;
+    }
+
+    /// <summary>
+    /// Returns when held background work may next run, or null if it may run now. Reaching the background floor
+    /// holds background work until the month resets. Must be called while holding <see cref="_stateLock"/>.
+    /// May throw, because it can invoke the user-supplied <see cref="ThrottleOptions.MonthResetRule"/>.
+    /// </summary>
+    private DateTimeOffset? BackgroundHeldUntilLocked(DateTimeOffset now)
+    {
+        ClearExpiredExhaustionLocked(now);
+
+        if (_exhaustedUntil is { } exhausted && now < exhausted)
+        {
+            return exhausted;
+        }
+
+        if (_backgroundHeldUntil is { } held && now < held)
+        {
+            return held;
+        }
+
+        if (_currentBudget is { MonthRemaining: { } remaining } && remaining <= _options.BackgroundReserve)
+        {
+            var until = _options.MonthResetRule(now);
+            _backgroundHeldUntil = until;
+            return until;
+        }
+
+        return null;
+    }
+
+    private LinkedList<Job> QueueFor(RequestPriority priority) =>
+        priority == RequestPriority.Background ? _backgroundQueue : _interactiveQueue;
+
+    private static void RemoveCompleted(LinkedList<Job> queue)
+    {
+        for (var node = queue.First; node is not null;)
+        {
+            var next = node.Next;
+            if (node.Value.Completion.Task.IsCompleted)
+            {
+                queue.Remove(node);
+            }
+
+            node = next;
+        }
+    }
+
     private async Task ProcessJobAsync(Job job)
     {
+        // Set when a background job that drew a monthly 429 is put back in its queue. It is still pending by
+        // design, so the finally-backstop below must leave it alone.
+        var requeued = false;
+
         // The try wraps the ENTIRE method body, not just the send/retry loop: the already-cancelled check,
         // the exhaustion/reserve checks (which invoke the user-supplied ThrottleOptions.MonthResetRule), and
         // CreateLinkedTokenSource are all capable of throwing, and previously sat outside any protection —
@@ -179,16 +435,21 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 return;
             }
 
-            if (TryGetMonthlyExhaustedException(out var exhaustedException))
+            // Background work was only taken off its queue because TakeNextStep found it eligible, and nothing
+            // but this single consumer changes the budget, so these checks apply to interactive work alone.
+            if (job.Priority == RequestPriority.Interactive)
             {
-                job.Completion.TrySetException(exhaustedException);
-                return;
-            }
+                if (TryGetMonthlyExhaustedException(out var exhaustedException))
+                {
+                    job.Completion.TrySetException(exhaustedException);
+                    return;
+                }
 
-            if (TryGetReserveExhaustedException(out var reserveException))
-            {
-                job.Completion.TrySetException(reserveException);
-                return;
+                if (TryGetReserveExhaustedException(out var reserveException))
+                {
+                    job.Completion.TrySetException(reserveException);
+                    return;
+                }
             }
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(job.Token, _shutdownCts.Token);
@@ -218,7 +479,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 }
                 catch (DtddMonthlyRateLimitException ex)
                 {
-                    HandleMonthlyExhaustion(ex, job);
+                    requeued = HandleMonthlyExhaustion(ex, job);
                     return;
                 }
 
@@ -257,8 +518,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         finally
         {
             // Absolute backstop: whatever happened above, never leave the caller's Task pending forever.
-            // A no-op if the job was already completed (success, cancellation, or a specific failure) above.
-            job.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
+            // A no-op if the job was already completed (success, cancellation, or a specific failure) above -
+            // and skipped for a job put back in its queue, which is pending on purpose.
+            if (!requeued)
+            {
+                job.Completion.TrySetException(new ObjectDisposedException(nameof(ThrottledDtddClient)));
+            }
         }
     }
 
@@ -339,7 +604,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// Checks whether the monthly budget is known to be exhausted until some future instant. Called both at
     /// enqueue time (<see cref="ThrowIfMonthlyExhausted"/>) and again at dequeue time from
     /// <see cref="ProcessJobAsync"/>, because a call can pass the enqueue-time check and still land in the
-    /// channel after a concurrent <see cref="HandleMonthlyExhaustion"/> has already drained it.
+    /// queue after a concurrent <see cref="HandleMonthlyExhaustion"/> has already drained it.
     /// </summary>
     private bool TryGetMonthlyExhaustedException(out DtddMonthlyRateLimitException exception)
     {
@@ -412,41 +677,70 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// If the exhaustion clock has passed, clears it along with the stale <see cref="RateLimitStatus.MonthRemaining"/>
-    /// figure that armed it (keeping <see cref="RateLimitStatus.MonthLimit"/> and the other fields), so exactly
-    /// one probe request is allowed out to re-seed the budget from real headers. Must be called while holding
-    /// <see cref="_stateLock"/>.
+    /// If an exhaustion or background-hold clock has passed, clears it along with the stale
+    /// <see cref="RateLimitStatus.MonthRemaining"/> figure that armed it (keeping
+    /// <see cref="RateLimitStatus.MonthLimit"/> and the other fields), so exactly one probe request is allowed out
+    /// to re-seed the budget from real headers. Without clearing it on a background hold too, last month's figure
+    /// - still at or under the floor - would re-hold background work straight into the following month. Must be
+    /// called while holding <see cref="_stateLock"/>.
     /// </summary>
     private void ClearExpiredExhaustionLocked(DateTimeOffset now)
     {
+        var monthRolledOver = false;
         if (_exhaustedUntil is { } until && now >= until)
         {
             _exhaustedUntil = null;
-            if (_currentBudget is { } budget)
-            {
-                _currentBudget = budget with { MonthRemaining = null };
-            }
+            monthRolledOver = true;
+        }
+
+        if (_backgroundHeldUntil is { } held && now >= held)
+        {
+            _backgroundHeldUntil = null;
+            monthRolledOver = true;
+        }
+
+        if (monthRolledOver && _currentBudget is { } budget)
+        {
+            _currentBudget = budget with { MonthRemaining = null };
         }
     }
 
     /// <summary>
-    /// Records the monthly budget as exhausted until the configured reset rule says otherwise, fails
-    /// <paramref name="job"/> with <paramref name="ex"/>, and drains every job currently queued behind it,
-    /// failing each with a fresh monthly exception carrying the time remaining until reset.
+    /// Records the monthly budget as exhausted until the configured reset rule says otherwise, then fails
+    /// interactive work - <paramref name="job"/> if it is interactive, and every interactive job queued behind
+    /// it - with a monthly exception carrying the time remaining until reset. Background work is held instead:
+    /// a background <paramref name="job"/> is put back at the front of its queue, and queued background jobs
+    /// stay where they are, all to be served once the month resets.
     /// </summary>
-    private void HandleMonthlyExhaustion(DtddMonthlyRateLimitException ex, Job job)
+    /// <returns>True if <paramref name="job"/> was put back in its queue, and so must not be completed.</returns>
+    private bool HandleMonthlyExhaustion(DtddMonthlyRateLimitException ex, Job job)
     {
         UpdateBudget(ex.RateLimit);
 
         var until = _options.MonthResetRule(_timeProvider.GetUtcNow());
+        List<Job> failed;
+        var requeued = false;
         lock (_stateLock)
         {
             _exhaustedUntil = until;
+
+            // Not after DisposeAsync has begun: the drain may already have run, which would strand the job.
+            if (job.Priority == RequestPriority.Background && !_addingCompleted)
+            {
+                _backgroundQueue.AddFirst(job);
+                requeued = true;
+            }
+
+            failed = [.. _interactiveQueue];
+            _interactiveQueue.Clear();
         }
 
-        job.Completion.TrySetException(ex);
+        if (!requeued)
+        {
+            job.Completion.TrySetException(ex);
+        }
 
-        while (_channel.Reader.TryRead(out var queued))
+        foreach (var queued in failed)
         {
             queued.Completion.TrySetException(new DtddMonthlyRateLimitException(
                 ex.StatusCode,
@@ -455,6 +749,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 CurrentBudget,
                 ClampNonNegative(until - _timeProvider.GetUtcNow())));
         }
+
+        return requeued;
     }
 
     private static TimeSpan ClampNonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
@@ -472,7 +768,12 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
         try
         {
-            _channel.Writer.TryComplete();
+            lock (_stateLock)
+            {
+                _addingCompleted = true;
+                _wake.TrySetResult();
+            }
+
             await _shutdownCts.CancelAsync().ConfigureAwait(false);
 
             try
@@ -481,7 +782,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // Expected: the loop's channel read observes _shutdownCts and unwinds via this exception.
+                // Expected: the loop's wait observes _shutdownCts and unwinds via this exception.
                 // Anything else escaping the loop is a genuine bug and should surface, not be swallowed.
             }
         }
@@ -497,6 +798,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     /// <summary>A unit of queued work: a wrapped API call plus the plumbing to report its outcome.</summary>
     private sealed class Job
     {
+        public required RequestPriority Priority { get; init; }
+
         public required Func<CancellationToken, Task<object>> Execute { get; init; }
 
         public required TaskCompletionSource<object> Completion { get; init; }
@@ -506,4 +809,37 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
 
     /// <summary>The boxed result of a successful job execution, before it is cast back to <c>T</c>.</summary>
     private sealed record JobSuccess(object? Value, DateTimeOffset FetchedAt);
+
+    /// <summary>
+    /// What the consumer loop should do next: run <see cref="Job"/> (or fail it with <see cref="Failure"/>), or
+    /// wait on <see cref="Wake"/>, and on a timer of <see cref="HeldFor"/> if held background work is waiting.
+    /// </summary>
+    private readonly record struct NextStep(Job? Job, Exception? Failure, Task? Wake, TimeSpan? HeldFor);
+
+    /// <summary>An <see cref="IDtddClient"/> that enqueues every call on its owner at one fixed priority.</summary>
+    private sealed class PriorityView(ThrottledDtddClient owner, RequestPriority priority) : IDtddClient
+    {
+        public RateLimitStatus? CurrentBudget => owner.CurrentBudget;
+
+        public Task<DtddResult<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
+            => owner.SearchItemsCoreAsync(search, priority, ct);
+
+        public Task<DtddResult<ItemDetail>> GetItemAsync(int itemId, CancellationToken ct = default)
+            => owner.GetItemCoreAsync(itemId, priority, ct);
+
+        public Task<DtddResult<IReadOnlyList<Rating>>> GetRatingsAsync(int itemId, int? topicId = null, CancellationToken ct = default)
+            => owner.GetRatingsCoreAsync(itemId, topicId, priority, ct);
+
+        public Task<DtddResult<IReadOnlyList<Topic>>> GetTopicsAsync(CancellationToken ct = default)
+            => owner.GetTopicsCoreAsync(priority, ct);
+
+        public Task<DtddResult<IReadOnlyList<ItemType>>> GetItemTypesAsync(CancellationToken ct = default)
+            => owner.GetItemTypesCoreAsync(priority, ct);
+
+        public Task<DtddResult<IReadOnlyList<TopicCategory>>> GetTopicCategoriesAsync(CancellationToken ct = default)
+            => owner.GetTopicCategoriesCoreAsync(priority, ct);
+
+        public Task<DtddResult<IReadOnlyList<TopicSuperCategory>>> GetTopicSuperCategoriesAsync(CancellationToken ct = default)
+            => owner.GetTopicSuperCategoriesCoreAsync(priority, ct);
+    }
 }
