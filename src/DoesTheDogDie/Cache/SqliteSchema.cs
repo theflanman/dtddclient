@@ -176,6 +176,26 @@ internal static class SqliteSchema
         );
         """;
 
+    /// <summary>
+    /// <see cref="ThrottledDtddClient"/> budget state, one row per budget id (see <see cref="IBudgetStore"/>).
+    /// <c>observed_at</c> is null exactly when no budget was ever observed. Added to schema v2 without a version bump:
+    /// it is purely additive, so older v2 readers ignore it, and <c>CREATE TABLE IF NOT EXISTS</c> on open adds it to
+    /// a v2 database that predates it.
+    /// </summary>
+    public const string CreateBudgetState = """
+        CREATE TABLE IF NOT EXISTS budget_state(
+            budget_id TEXT PRIMARY KEY,
+            minute_limit INTEGER,
+            minute_remaining INTEGER,
+            month_limit INTEGER,
+            month_remaining INTEGER,
+            observed_at TEXT,
+            month_ends_at TEXT,
+            exhausted_until TEXT,
+            background_held_until TEXT
+        );
+        """;
+
     /// <summary>Every statement needed to create the current schema. Each is idempotent.</summary>
     public static readonly string CreateAll = string.Join(
         '\n',
@@ -190,5 +210,6 @@ internal static class SqliteSchema
         CreateItemTypes,
         CreateTopicCategories,
         CreateTopicSuperCategories,
-        CreateLookups);
+        CreateLookups,
+        CreateBudgetState);
 }

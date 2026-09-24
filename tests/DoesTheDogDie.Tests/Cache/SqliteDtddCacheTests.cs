@@ -11,7 +11,7 @@ public sealed class SqliteDtddCacheTests : DtddCacheContractTests, IDisposable
 {
     private static readonly string[] V2Tables =
     [
-        "item_genres", "item_types", "items", "lookups", "meta", "rating_sets", "ratings",
+        "budget_state", "item_genres", "item_types", "items", "lookups", "meta", "rating_sets", "ratings",
         "taxonomy", "topic_categories", "topic_item_stats", "topic_super_categories", "topics",
     ];
 
@@ -241,6 +241,70 @@ public sealed class SqliteDtddCacheTests : DtddCacheContractTests, IDisposable
         Assert.Equal("1", SchemaVersion(_path));
         Assert.Equal(["items", "lookups", "meta", "ratings", "taxonomy"], TableNames());
         Assert.Single(Query<string>("SELECT json FROM items WHERE id = 10752;"));
+    }
+
+    [Fact]
+    public void BudgetStore_RoundTrip_IsExact()
+    {
+        // Breaks: a budget column dropped or mis-mapped (full); NULL read back as 0 (headerless); a budget that
+        // was never observed confused with one observed with every header missing (unobserved vs headerless).
+        var cache = (SqliteDtddCache)CreateCache(CachePolicy.Default, TimeProvider.System);
+        var full = new BudgetState(
+            new RateLimitStatus(30, 12, 5000, 4321, DateTimeOffset.Parse("2026-09-16T12:00:01.5Z")),
+            MonthEndsAt: DateTimeOffset.Parse("2026-10-01T00:00:00Z"),
+            ExhaustedUntil: DateTimeOffset.Parse("2026-10-02T00:00:00Z"),
+            BackgroundHeldUntil: DateTimeOffset.Parse("2026-10-03T00:00:00Z"));
+        var headerless = new BudgetState(new RateLimitStatus(null, null, null, null, DateTimeOffset.Parse("2026-09-17T08:30:00Z")), null, null, null);
+        var unobserved = new BudgetState(null, null, null, null);
+
+        cache.SaveBudget("full", full);
+        cache.SaveBudget("headerless", headerless);
+        cache.SaveBudget("unobserved", unobserved);
+
+        Assert.Equal(full, cache.LoadBudget("full"));
+        Assert.Equal(headerless, cache.LoadBudget("headerless"));
+        Assert.Equal(unobserved, cache.LoadBudget("unobserved"));
+    }
+
+    [Fact]
+    public void BudgetStore_ReplacesAndIsKeyedById()
+    {
+        // Breaks: a save appending instead of replacing; ids sharing a row; a missing id reading as a default
+        // state rather than null.
+        var cache = (SqliteDtddCache)CreateCache(CachePolicy.Default, TimeProvider.System);
+        var first = new BudgetState(null, null, DateTimeOffset.Parse("2026-10-01T00:00:00Z"), null);
+        var second = new BudgetState(null, null, null, DateTimeOffset.Parse("2026-10-01T00:00:00Z"));
+        var other = new BudgetState(null, DateTimeOffset.Parse("2026-11-01T00:00:00Z"), null, null);
+
+        cache.SaveBudget("a", first);
+        cache.SaveBudget("b", other);
+        cache.SaveBudget("a", second);
+
+        Assert.Equal(second, cache.LoadBudget("a"));
+        Assert.Equal(other, cache.LoadBudget("b"));
+        Assert.Null(cache.LoadBudget("never-saved"));
+    }
+
+    [Fact]
+    public void Open_V2DatabaseWithoutBudgetTable_AddsIt()
+    {
+        // Break: a database already at schema v2 from before budget_state existed - exactly what the previous
+        // release leaves on disk - never gains the table, so every save fails and persistence silently never works.
+        _ = CreateCache(CachePolicy.Default, TimeProvider.System);
+        using (var connection = new SqliteConnection($"Data Source={_path};Pooling=False"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "DROP TABLE budget_state;";
+            command.ExecuteNonQuery();
+        }
+
+        var reopened = new SqliteDtddCache($"Data Source={_path}");
+        var state = new BudgetState(null, null, DateTimeOffset.Parse("2026-10-01T00:00:00Z"), null);
+        reopened.SaveBudget("a", state);
+
+        Assert.Equal(state, reopened.LoadBudget("a"));
+        Assert.Equal("2", SchemaVersion(_path));
     }
 
     public void Dispose()

@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 
@@ -9,13 +11,14 @@ namespace DoesTheDogDie.Api;
 /// Does not read or set <see cref="HttpClient.BaseAddress"/> or <see cref="HttpClient.DefaultRequestHeaders"/>,
 /// so a single <see cref="HttpClient"/> instance can safely be shared with unrelated callers.
 /// </summary>
-public sealed class DtddApiClient : IDtddApiClient
+public sealed class DtddApiClient : IDtddApiClient, IBudgetIdentity
 {
     private const string ApiKeyHeader = "X-API-KEY";
 
     private readonly HttpClient _httpClient;
     private readonly DtddApiOptions _options;
     private readonly TimeProvider _timeProvider;
+    private readonly string _budgetId;
 
     public DtddApiClient(HttpClient httpClient, DtddApiOptions options, TimeProvider? timeProvider = null)
     {
@@ -37,7 +40,10 @@ public sealed class DtddApiClient : IDtddApiClient
         }
 
         _options = new DtddApiOptions { ApiKey = options.ApiKey, BaseAddress = baseAddress };
+        _budgetId = ComputeBudgetId(baseAddress, options.ApiKey);
     }
+
+    string IBudgetIdentity.BudgetId => _budgetId;
 
     public async Task<ApiResponse<IReadOnlyList<Item>>> SearchItemsAsync(ItemSearch search, CancellationToken ct = default)
     {
@@ -131,4 +137,12 @@ public sealed class DtddApiClient : IDtddApiClient
 
         return new ApiResponse<T>(value, rateLimit);
     }
+
+    /// <summary>
+    /// One budget per API key per server: the same key against a mock server (as end-to-end tests point
+    /// <see cref="DtddApiOptions.BaseAddress"/> at) is a different budget from the real one. Hashed so the key never
+    /// reaches the budget store; a URI cannot contain a newline, so the separator is unambiguous.
+    /// </summary>
+    private static string ComputeBudgetId(Uri baseAddress, string apiKey) =>
+        "sha256:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(baseAddress.AbsoluteUri + "\n" + apiKey)));
 }

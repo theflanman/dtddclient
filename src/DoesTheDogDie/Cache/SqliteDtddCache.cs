@@ -22,7 +22,7 @@ namespace DoesTheDogDie.Cache;
 /// complete synchronously anyway.
 /// </para>
 /// </remarks>
-public sealed class SqliteDtddCache : IDtddCache
+public sealed class SqliteDtddCache : IDtddCache, IBudgetStore
 {
     private const int AllTopicsSentinel = -1;
 
@@ -119,6 +119,55 @@ public sealed class SqliteDtddCache : IDtddCache
                 throw new InvalidOperationException(
                     $"Cache database has schema version '{other}' but this library supports version '{SqliteSchema.Version}' and has no migration from it.");
         }
+    }
+
+    /// <inheritdoc />
+    public BudgetState? LoadBudget(string budgetId)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        var rows = ReadRows(
+            connection,
+            null,
+            """
+            SELECT minute_limit, minute_remaining, month_limit, month_remaining, observed_at,
+                   month_ends_at, exhausted_until, background_held_until
+            FROM budget_state WHERE budget_id = $id;
+            """,
+            r => new BudgetState(
+                r.IsDBNull(4)
+                    ? null
+                    : new RateLimitStatus(GetNullableInt32(r, 0), GetNullableInt32(r, 1), GetNullableInt32(r, 2), GetNullableInt32(r, 3), ParseFetchedAt(r.GetString(4))),
+                GetNullableInstant(r, 5),
+                GetNullableInstant(r, 6),
+                GetNullableInstant(r, 7)),
+            ("$id", budgetId));
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    /// <inheritdoc />
+    public void SaveBudget(string budgetId, BudgetState state)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        Execute(
+            connection,
+            null,
+            """
+            INSERT OR REPLACE INTO budget_state(budget_id, minute_limit, minute_remaining, month_limit, month_remaining,
+                                                observed_at, month_ends_at, exhausted_until, background_held_until)
+            VALUES ($id, $minuteLimit, $minuteRemaining, $monthLimit, $monthRemaining,
+                    $observedAt, $monthEndsAt, $exhaustedUntil, $backgroundHeldUntil);
+            """,
+            ("$id", budgetId),
+            ("$minuteLimit", state.Budget?.MinuteLimit),
+            ("$minuteRemaining", state.Budget?.MinuteRemaining),
+            ("$monthLimit", state.Budget?.MonthLimit),
+            ("$monthRemaining", state.Budget?.MonthRemaining),
+            ("$observedAt", state.Budget is { } budget ? FormatFetchedAt(budget.ObservedAt) : null),
+            ("$monthEndsAt", FormatNullableInstant(state.MonthEndsAt)),
+            ("$exhaustedUntil", FormatNullableInstant(state.ExhaustedUntil)),
+            ("$backgroundHeldUntil", FormatNullableInstant(state.BackgroundHeldUntil)));
     }
 
     public async Task<CacheEntry<ItemDetail>?> GetItemAsync(int itemId, CancellationToken ct = default)
@@ -635,6 +684,12 @@ public sealed class SqliteDtddCache : IDtddCache
         var isStale = _time.GetUtcNow() - fetchedAt > maxAge;
         return new CacheEntry<T>(value, fetchedAt, isStale);
     }
+
+    private static DateTimeOffset? GetNullableInstant(SqliteDataReader reader, int ordinal) =>
+        reader.IsDBNull(ordinal) ? null : ParseFetchedAt(reader.GetString(ordinal));
+
+    private static string? FormatNullableInstant(DateTimeOffset? value) =>
+        value is { } instant ? FormatFetchedAt(instant) : null;
 
     private static string FormatFetchedAt(DateTimeOffset fetchedAt) =>
         fetchedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);

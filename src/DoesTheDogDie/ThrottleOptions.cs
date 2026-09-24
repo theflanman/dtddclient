@@ -27,6 +27,14 @@ public sealed class ThrottleOptions
     public int MaxQueueLength { get; init; } = 1000;
 
     /// <summary>
+    /// Where to persist budget state across restarts, or null (the default) to keep it in memory only. State is
+    /// kept per budget - per API key and server - as named by <see cref="Api.DtddApiClient"/>; an API client that
+    /// names no budget does not persist. Failures to load or save never fail a request: without persisted state the
+    /// client simply probes the API once, as it would with no store. <see cref="Cache.SqliteDtddCache"/> is a store.
+    /// </summary>
+    public IBudgetStore? BudgetStore { get; init; }
+
+    /// <summary>
     /// The per-minute request limit to assume before any rate-limit headers have been observed.
     /// </summary>
     public int DefaultMinuteLimit { get; init; } = 30;
