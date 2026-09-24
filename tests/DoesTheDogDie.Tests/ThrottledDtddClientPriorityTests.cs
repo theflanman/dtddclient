@@ -15,7 +15,13 @@ namespace DoesTheDogDie.Tests;
 /// "Background was held" is never asserted as a snapshot ("not completed yet"): that races the consumer loop,
 /// and a broken implementation could pass simply because the loop had not reached the job. Instead the fake
 /// stamps every call with the fake-clock time it arrived, and once the held job completes the test asserts it
-/// reached the API no earlier than the reset. Deterministic in both directions.
+/// reached the API no earlier than the reset.
+/// <para>
+/// Arrival stamps alone never make a correct client flaky, but they can let a broken one pass: if a client failed to
+/// hold, its call could still land after the test advanced the clock. So a test holding work at a floor first waits
+/// on <see cref="Sut.WaitUntilBackgroundHeldAsync"/>, which only a client that decided to hold can satisfy. Holds
+/// armed by a 429 need no barrier, because the 429 arms them before the held job can be considered.
+/// </para>
 /// </remarks>
 public class ThrottledDtddClientPriorityTests
 {
@@ -28,8 +34,12 @@ public class ThrottledDtddClientPriorityTests
     {
         var fake = new FakeApiClient();
         var time = new FakeTimeProvider(StartTime);
-        var client = new ThrottledDtddClient(fake, options, time);
-        var sut = new Sut(fake, time, client, client.ForPriority(RequestPriority.Background));
+        var store = new MemoryBudgetStore();
+
+        // With default options the client persists to `store`, which is what makes a hold observable (see
+        // Sut.WaitUntilBackgroundHeldAsync). Tests passing their own options get no store and must not wait on one.
+        var client = new ThrottledDtddClient(new KeyedApiClient(fake, Sut.BudgetId), options ?? new ThrottleOptions { BudgetStore = store }, time);
+        var sut = new Sut(fake, time, client, client.ForPriority(RequestPriority.Background), store);
         fake.BeforeRespond = (call, _) =>
         {
             sut.Arrivals.Enqueue((call, time.GetUtcNow()));
@@ -83,6 +93,7 @@ public class ThrottledDtddClientPriorityTests
         await sut.SeedMonthRemainingAsync(500);
 
         var held = sut.Background.GetItemTypesAsync();
+        await sut.WaitUntilBackgroundHeldAsync();
         var interactive = await sut.Client.GetTopicCategoriesAsync();
         await sut.AdvanceToResetAsync(held);
 
@@ -277,6 +288,7 @@ public class ThrottledDtddClientPriorityTests
         var sut = CreateSut();
         await sut.SeedMonthRemainingAsync(500);
         var held = sut.Background.GetItemTypesAsync();
+        await sut.WaitUntilBackgroundHeldAsync();
 
         await sut.Client.DisposeAsync();
 
@@ -294,6 +306,7 @@ public class ThrottledDtddClientPriorityTests
         using var cts = new CancellationTokenSource();
 
         var held = sut.Background.GetItemTypesAsync(cts.Token);
+        await sut.WaitUntilBackgroundHeldAsync();
         await cts.CancelAsync();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => held.WaitAsync(HangGuard));
@@ -351,8 +364,18 @@ public class ThrottledDtddClientPriorityTests
         Assert.True(sut.ArrivalOf("ItemTypes") < ThrottleOptions.NextUtcMonthStart(ResetAt));
     }
 
-    private sealed record Sut(FakeApiClient Fake, FakeTimeProvider Time, ThrottledDtddClient Client, IDtddClient Background)
+    private sealed record Sut(FakeApiClient Fake, FakeTimeProvider Time, ThrottledDtddClient Client, IDtddClient Background, MemoryBudgetStore Store)
     {
+        public const string BudgetId = "sut";
+
+        /// <summary>
+        /// Waits until the consumer has decided to hold background work. A hold is persisted before the consumer
+        /// sleeps on it; a client that fails to hold never writes one, so this fails instead of letting that client
+        /// pass by winning a race with the clock. Requires the default options (see <see cref="CreateSut"/>).
+        /// </summary>
+        public Task WaitUntilBackgroundHeldAsync() =>
+            AsyncAssert.WaitUntilAsync(() => Store.Peek(BudgetId)?.BackgroundHeldUntil is not null);
+
         public ConcurrentQueue<(string Call, DateTimeOffset At)> Arrivals { get; } = new();
 
         public DateTimeOffset ArrivalOf(string call) => Arrivals.Single(a => a.Call == call).At;

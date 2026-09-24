@@ -32,6 +32,8 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private readonly Lock _stateLock = new();
     private readonly TaskCompletionSource _disposeCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly PriorityView _backgroundView;
+    private readonly IBudgetStore? _budgetStore;
+    private readonly string? _budgetId;
 
     // Two queues, not one ordered channel: holding background work needs to peek at it, put a job back at the
     // front after a 429, and drain interactive work alone - none of which a Channel supports. Guarded by
@@ -47,6 +49,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
     private DateTimeOffset? _budgetMonthEndsAt;
     private TaskCompletionSource _wake = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _addingCompleted;
+    private bool _stateChanged;
     private int _disposedFlag;
 
     public ThrottledDtddClient(IDtddApiClient inner, ThrottleOptions? options = null, TimeProvider? timeProvider = null)
@@ -64,6 +67,13 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 $"{nameof(ThrottleOptions.MonthlyReserve)} ({_options.MonthlyReserve}), or background work could " +
                 "spend the interactive reserve.",
                 nameof(options));
+        }
+
+        if (_options.BudgetStore is { } store && inner is IBudgetIdentity identity)
+        {
+            _budgetStore = store;
+            _budgetId = identity.BudgetId;
+            RestoreState();
         }
 
         _backgroundView = new PriorityView(this, RequestPriority.Background);
@@ -249,6 +259,10 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                 _shutdownCts.Token.ThrowIfCancellationRequested();
 
                 var step = TakeNextStep();
+
+                // Before running or sleeping: TakeNextStep may have armed or cleared a hold, and a hold must be on
+                // disk before the consumer sleeps on it.
+                PersistStateIfChanged();
                 if (step.Job is { } job)
                 {
                     if (step.Failure is { } failure)
@@ -260,6 +274,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
                         await ProcessJobAsync(job).ConfigureAwait(false);
                     }
 
+                    PersistStateIfChanged();
                     continue;
                 }
 
@@ -394,6 +409,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         {
             var until = _options.MonthResetRule(now);
             _backgroundHeldUntil = until;
+            _stateChanged = true;
             return until;
         }
 
@@ -605,6 +621,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         {
             _currentBudget = rateLimit;
             _budgetMonthEndsAt = monthEndsAt;
+            _stateChanged = true;
         }
     }
 
@@ -681,6 +698,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             lock (_stateLock)
             {
                 _exhaustedUntil = until;
+                _stateChanged = true;
             }
 
             exception = new DtddMonthlyRateLimitException(
@@ -726,9 +744,13 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
             monthRolledOver = true;
         }
 
-        if (monthRolledOver && _currentBudget is { } budget)
+        if (monthRolledOver)
         {
-            _currentBudget = budget with { MonthRemaining = null };
+            _stateChanged = true;
+            if (_currentBudget is { } budget)
+            {
+                _currentBudget = budget with { MonthRemaining = null };
+            }
         }
     }
 
@@ -750,6 +772,7 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         lock (_stateLock)
         {
             _exhaustedUntil = until;
+            _stateChanged = true;
 
             // Not after DisposeAsync has begun: the drain may already have run, which would strand the job.
             if (job.Priority == RequestPriority.Background && !_addingCompleted)
@@ -778,6 +801,74 @@ public sealed class ThrottledDtddClient : IDtddClient, IAsyncDisposable
         }
 
         return requeued;
+    }
+
+    /// <summary>
+    /// Loads persisted state into this client, before the consumer loop starts. A stale deadline needs no special
+    /// handling: every deadline is absolute, so the usual expiry sweep retires it on first use. A failing store is
+    /// ignored - the client starts fresh, exactly as it would with no store.
+    /// </summary>
+    private void RestoreState()
+    {
+        BudgetState? state;
+        try
+        {
+            state = _budgetStore!.LoadBudget(_budgetId!);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        if (state is null)
+        {
+            return;
+        }
+
+        lock (_stateLock)
+        {
+            _currentBudget = state.Budget;
+            _budgetMonthEndsAt = state.MonthEndsAt;
+            _exhaustedUntil = state.ExhaustedUntil;
+            _backgroundHeldUntil = state.BackgroundHeldUntil;
+        }
+    }
+
+    /// <summary>
+    /// Saves budget state if it changed since the last save. Called only from the consumer loop, at its
+    /// boundaries, so the store sees one writer and a consistent snapshot. A failed save is retried at the next
+    /// boundary rather than failing anything.
+    /// </summary>
+    private void PersistStateIfChanged()
+    {
+        if (_budgetStore is null)
+        {
+            return;
+        }
+
+        BudgetState state;
+        lock (_stateLock)
+        {
+            if (!_stateChanged)
+            {
+                return;
+            }
+
+            _stateChanged = false;
+            state = new BudgetState(_currentBudget, _budgetMonthEndsAt, _exhaustedUntil, _backgroundHeldUntil);
+        }
+
+        try
+        {
+            _budgetStore.SaveBudget(_budgetId!, state);
+        }
+        catch (Exception)
+        {
+            lock (_stateLock)
+            {
+                _stateChanged = true;
+            }
+        }
     }
 
     private static TimeSpan ClampNonNegative(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
