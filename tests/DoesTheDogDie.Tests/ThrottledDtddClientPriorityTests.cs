@@ -317,6 +317,40 @@ public class ThrottledDtddClientPriorityTests
         Assert.Equal(ResultSource.Live, after.Source);
     }
 
+    [Fact]
+    public async Task BudgetFromLastMonth_DoesNotRefuseInteractiveThisMonth()
+    {
+        // Break: a MonthRemaining observed last month still counted this month. September's last response left
+        // 50 (the interactive floor) and nothing checked it before the reset, so October's first request trips
+        // the floor on a stale figure - and arms exhaustion until November.
+        var sut = CreateSut();
+        await using var _ = sut.Client;
+        await sut.SeedMonthRemainingAsync(50);
+
+        sut.Time.Advance(ResetAt - sut.Time.GetUtcNow() + TimeSpan.FromDays(1));
+        sut.Fake.NextRateLimit = new RateLimitStatus(30, 30, 5000, 4999, sut.Time.GetUtcNow());
+        var result = await sut.Client.GetItemTypesAsync().WaitAsync(HangGuard);
+
+        Assert.Equal(ResultSource.Live, result.Source);
+    }
+
+    [Fact]
+    public async Task BudgetFromLastMonth_DoesNotHoldBackgroundThisMonth()
+    {
+        // Break: as above for the background floor - September's 500 would hold October's background work
+        // until November.
+        var sut = CreateSut();
+        await using var _ = sut.Client;
+        await sut.SeedMonthRemainingAsync(500);
+
+        sut.Time.Advance(ResetAt - sut.Time.GetUtcNow() + TimeSpan.FromDays(1));
+        sut.Fake.NextRateLimit = new RateLimitStatus(30, 30, 5000, 4999, sut.Time.GetUtcNow());
+        var result = await sut.Background.GetItemTypesAsync().WaitAsync(HangGuard);
+
+        Assert.Equal(ResultSource.Live, result.Source);
+        Assert.True(sut.ArrivalOf("ItemTypes") < ThrottleOptions.NextUtcMonthStart(ResetAt));
+    }
+
     private sealed record Sut(FakeApiClient Fake, FakeTimeProvider Time, ThrottledDtddClient Client, IDtddClient Background)
     {
         public ConcurrentQueue<(string Call, DateTimeOffset At)> Arrivals { get; } = new();
